@@ -1,0 +1,75 @@
+# ============================================================================
+# ScriptVault OCR — .gitignore
+# Python + Deep Learning (PaddlePaddle / OpenCV) + Nuitka / PyInstaller
+# ============================================================================
+
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+build/
+dist/
+*.pyz
+
+# --- Virtual environments -------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# --- Caches & tooling artifacts ------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+.tox/
+
+# --- Build artifacts (Nuitka / PyInstaller) --------------------------------
+*.spec
+*.exe
+*.pyd
+*.so
+*.dll
+*.manifest
+nuitka-*/
+__main__.bin
+
+# --- Model weights & model caches ------------------------------------------
+# Keep the models/ directory structure (see models/.gitkeep) but never commit
+# binary weights or the paddle/paddlex download caches.
+models/*
+!models/.gitkeep
+.paddleocr/
+.paddlex/
+*.pdmodel
+*.pdiparams
+*.pdiparams.info
+*.pdopt
+*.onnx
+
+# --- Test data, samples & logs ----------------------------------------------
+logs/
+*.log
+samples/
+test_images/
+_tmp/
+_dbg*
+*_ocr_test.png
+
+# --- PDF/OCR intermediates ---------------------------------------------------
+*.png.tmp
+
+# --- OS / IDE --------------------------------------------------------------
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo

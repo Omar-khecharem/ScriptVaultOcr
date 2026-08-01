@@ -1,0 +1,31 @@
+# ============================================================================
+# ScriptVault OCR — Dépendances verrouillées (généré le 2026-08-01)
+# ----------------------------------------------------------------------------
+# Plateformes cibles : Windows x64, Linux x64, macOS arm64
+# CPython supporté   : 3.9 → 3.13 (wheels vérifiés sur PyPI)
+#
+# Installation:  pip install -r requirements.txt
+# Compilation:   pip install nuitka pyinstaller  (inclut dans ce fichier)
+# ============================================================================
+
+# --- Moteur OCR local (PaddleOCR CPU) ---------------------------------------
+paddlepaddle==3.3.1          # CPU x64/arm64 (win/manylinux/macos) — wheels cp313 vérifiés
+paddleocr==3.7.0             # Détection + reconnaissance + classification d'angle
+opencv-contrib-python==4.10.0.84     # Exigé exactement par paddleocr 3.7 (pas d'opencv-python : collision cv2.pyd)
+numpy==2.3.5                 # Compatible Paddle 3.x et OpenCV 4.14
+
+# --- Interface desktop (PySide6) --------------------------------------------
+PySide6==6.11.1              # QThread + Signaux + Widgets (partie 2 et 3)
+Pillow==12.3.0               # Images (dépendance PySide6/paddleocr)
+
+# --- Exportations ------------------------------------------------------------
+reportlab==5.0.0             # PDF avec couche texte sélectionnable
+python-docx==1.2.0           # Export Word .docx
+PyMuPDF==1.28.0              # Rasterisation PDF page par page
+
+# --- Compilation / Packaging (build uniquement) -----------------------------
+nuitka==4.1.3                # Compilateur C++ (recommandé, source cachée)
+pyinstaller==6.21.0          # Alternative (bundleur Python)
+
+# --- Optionnel : GPU (remplace paddlepaddle CPU) ----------------------------
+# paddlepaddle-gpu==3.3.1    # CUDA 12 — décommenter pour les machines GPU

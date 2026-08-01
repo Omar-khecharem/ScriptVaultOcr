@@ -1,0 +1,9 @@
+# Placeholder to keep the models/ directory structure in version control.
+# Copy your offline OCR weights here before building a self-contained .exe:
+#
+#   models/
+#   ├── det/    (text detection weights, e.g. inference.pdmodel)
+#   ├── rec/    (recognition weights)
+#   └── cls/    (textline orientation weights, optional)
+#
+# Binary weight files are ignored by .gitignore; only this file is tracked.
