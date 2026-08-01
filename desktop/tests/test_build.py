@@ -2,9 +2,8 @@
 
 from pathlib import Path
 
-import pytest
-
 import build_installer as bi
+import pytest
 
 
 def test_version():

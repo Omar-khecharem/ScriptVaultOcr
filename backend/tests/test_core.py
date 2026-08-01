@@ -5,9 +5,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
-
-import core_ocr
-from core_ocr import (
+from scriptvault import core_ocr
+from scriptvault.core_ocr import (
     ImagePreprocessor,
     LocalOCREngine,
     OCRBaseError,

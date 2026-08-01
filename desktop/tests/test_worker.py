@@ -1,7 +1,6 @@
 """Tests unitaires du worker de traitement par lots (PySide6)."""
 
 import pytest
-
 import worker_thread
 from worker_thread import BatchWorker, CancellationToken, CancelledError
 

@@ -4,6 +4,8 @@ Ce script produit un exécutable autonome (sans interpréteur Python requis)
 à partir de ``gui_app.py`` via **Nuitka** (recommandé) ou **PyInstaller**,
 en incluant automatiquement :
 
+* le package partagé ``scriptvault`` (moteur OCR, via ``--include-package`` /
+  ``--collect-submodules`` — installé en editable depuis ``../backend``),
 * les sous-dossiers de poids des modèles OCR (``*.pdparams``, ``*.pdmodel``,
   ``*.pdopt``, ``*.onnx``) découverts dans le projet (``models/``,
   ``weights/``, ``engine/``...),
@@ -228,9 +230,7 @@ def _nuitka_command(cfg: BuildConfig) -> list[str]:
         "nuitka",
         "--assume-yes-for-downloads",
         "--enable-plugin=pyside6",
-        "--include-package=core_ocr",
-        "--include-package=worker_thread",
-        "--include-package=gui_app",
+        "--include-package=scriptvault",
         "--include-package=paddle",
         "--include-package=paddleocr",
         "--include-package-data=paddle",
@@ -285,6 +285,8 @@ def _pyinstaller_command(cfg: BuildConfig) -> list[str]:
     # Paddle / PaddleOCR / PyMuPDF : embarque modules + données + DLLs natives
     for package in ("paddle", "paddleocr", "fitz", "PyMuPDF"):
         cmd.extend(["--collect-all", package])
+    # Moteur partagé (package scriptvault installé en editable)
+    cmd.extend(["--collect-submodules", "scriptvault"])
 
     for model_dir in cfg.models:
         src = str(model_dir)
@@ -409,7 +411,7 @@ def build(cfg: BuildConfig) -> int:
     if not cfg.entry.is_file():
         raise BuildError(
             f"Point d'entrée introuvable: {cfg.entry} — "
-            "lancez le script depuis la racine du projet."
+            "lancez le script depuis le dossier desktop/."
         )
 
     discover_project_resources(cfg)

@@ -1,6 +1,6 @@
 # ============================================================================
 # ScriptVault OCR — GitHub Actions CI
-# Lint (Ruff) + Type-check (Mypy) + Tests on Ubuntu & Windows
+# Monorepo : backend (Ruff/Mypy/Pytest) + desktop (Pytest/PySide6) + web (Vite)
 # ============================================================================
 name: CI
 
@@ -60,10 +60,13 @@ jobs:
         run: pip install mypy
 
       - name: Mypy
-        run: mypy core_ocr.py worker_thread.py build_installer.py
+        run: >
+          mypy
+          backend/scriptvault backend/main.py
+          desktop/gui_app.py desktop/worker_thread.py desktop/build_installer.py
 
-  test:
-    name: Test (${{ matrix.os }})
+  python-test:
+    name: Python tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -80,11 +83,35 @@ jobs:
           python-version: "3.13"
           cache: pip
 
-      - name: Install dependencies
+      - name: Install dependencies (sans PaddlePaddle : tests isolés)
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest
+          pip install -e ./backend --no-deps
+          pip install pytest httpx fastapi "uvicorn[standard]" python-multipart \
+                      opencv-contrib-python numpy reportlab python-docx PyMuPDF PySide6
 
       - name: Run tests
-        run: python -m pytest tests -q
+        run: python -m pytest backend/tests desktop/tests -q
+
+  web:
+    name: Web (Vite build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
+        working-directory: web
+
+      - name: Build
+        run: npm run build
+        working-directory: web

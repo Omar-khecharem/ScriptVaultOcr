@@ -203,7 +203,11 @@ class ImagePreprocessor:
             OCRImageError: Les données ne correspondent à aucune image
                 décodable (format non supporté ou fichier corrompu).
         """
-        raw = np.asarray(data, dtype=np.uint8)
+        raw = (
+            np.frombuffer(data, dtype=np.uint8)
+            if isinstance(data, (bytes, bytearray, memoryview))
+            else np.asarray(data, dtype=np.uint8)
+        )
         if raw.size == 0:
             raise OCRImageError("Données image vides.")
         image = cv2.imdecode(raw, cv2.IMREAD_COLOR)

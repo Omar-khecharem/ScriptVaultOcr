@@ -1,6 +1,6 @@
 # ============================================================================
 # ScriptVault OCR — .gitignore
-# Python + Deep Learning (PaddlePaddle / OpenCV) + Nuitka / PyInstaller
+# Monorepo : backend/ (Python + FastAPI), desktop/ (PySide6), web/ (Vite)
 # ============================================================================
 
 # --- Python ---------------------------------------------------------------
@@ -20,6 +20,12 @@ venv/
 env/
 ENV/
 .conda/
+
+# --- Node / Vite ----------------------------------------------------------
+node_modules/
+web/dist/
+npm-debug.log*
+*.local
 
 # --- Caches & tooling artifacts ------------------------------------------
 .pytest_cache/

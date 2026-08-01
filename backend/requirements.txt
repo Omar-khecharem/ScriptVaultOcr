@@ -1,0 +1,29 @@
+# ============================================================================
+# ScriptVault OCR — Backend (API FastAPI + moteur partagé)
+# ----------------------------------------------------------------------------
+# Installe le package local (scriptvault) et ses dépendances verrouillées.
+#   pip install -r requirements.txt
+# Lancement :  python main.py        (ou :  uvicorn scriptvault.api.app:create_app --factory)
+# ============================================================================
+
+-e .                                  # package local (moteur + API)
+
+# --- Moteur OCR local (PaddleOCR CPU) ---------------------------------------
+paddlepaddle==3.3.1                   # CPU x64/arm64 — wheels cp313 vérifiés
+paddleocr==3.7.0                      # Détection + reconnaissance + orientation
+opencv-contrib-python==4.10.0.84      # Exigé exactement par paddleocr 3.7
+numpy==2.3.5                          # Compatible Paddle 3.x / OpenCV 4.14
+
+# --- API serveur ------------------------------------------------------------
+fastapi>=0.115,<1                     # Framework REST asynchrone
+uvicorn[standard]>=0.30,<1            # Serveur ASGI
+python-multipart>=0.0.9               # Parsing multipart (upload de fichiers)
+pydantic>=2.7                         # Schémas de validation (via FastAPI)
+
+# --- Exports & PDF ----------------------------------------------------------
+reportlab>=4.2,<6                     # PDF avec couche texte sélectionnable
+python-docx>=1.1,<2                   # Export Word .docx
+PyMuPDF>=1.24,<2                      # Rasterisation PDF page par page
+
+# --- Développement / tests --------------------------------------------------
+# pytest httpx ruff mypy   (ou : pip install -e ".[dev]")

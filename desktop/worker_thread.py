@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         "PySide6 est requis. Installez-le avec: pip install PySide6"
     ) from exc
 
-from core_ocr import OCRBaseError
+from scriptvault.core_ocr import OCRBaseError
 
 __version__ = "1.0.0"
 __all__ = [
@@ -512,8 +512,7 @@ def main() -> int:
     import sys
 
     from PySide6.QtCore import QCoreApplication
-
-    from core_ocr import LocalOCREngine
+    from scriptvault.core_ocr import LocalOCREngine
 
     parser = argparse.ArgumentParser(
         description="Traitement OCR par lots, multithread (PySide6)."

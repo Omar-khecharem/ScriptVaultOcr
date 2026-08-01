@@ -69,8 +69,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-from core_ocr import ImagePreprocessor, LocalOCREngine
+from scriptvault.core_ocr import ImagePreprocessor, LocalOCREngine
 from worker_thread import BatchWorker
 
 __version__ = "1.0.0"
@@ -1004,7 +1003,7 @@ class MainWindow(QMainWindow):
         try:
             image = self._preprocessor.read_image(path)
         except Exception:
-            blank = np.full((400, 600, 3), 245, dtype=np.uint8)
+            blank: np.ndarray = np.full((400, 600, 3), 245, dtype=np.uint8)
             return blank
         if self._engine is not None:
             try:
