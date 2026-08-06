@@ -922,17 +922,29 @@ class MainWindow(QMainWindow):
         try:
             for index, page in enumerate(doc, start=1):
                 pix = page.get_pixmap(dpi=160)
+                samples = bytes(pix.samples)
+                if pix.n == 2:
+                    pix = pix.copy(alpha=False)
+                    samples = bytes(pix.samples)
                 if pix.n == 4:
                     qimage = QImage(
-                        bytes(pix.samples),
+                        samples,
                         pix.width,
                         pix.height,
                         pix.stride,
                         QImage.Format.Format_RGBA8888,
                     )
+                elif pix.n == 1:
+                    qimage = QImage(
+                        samples,
+                        pix.width,
+                        pix.height,
+                        pix.stride,
+                        QImage.Format.Format_Grayscale8,
+                    )
                 else:
                     qimage = QImage(
-                        bytes(pix.samples),
+                        samples,
                         pix.width,
                         pix.height,
                         pix.stride,
@@ -1137,10 +1149,8 @@ class MainWindow(QMainWindow):
         for row in range(self._file_list.count()):
             item = self._file_list.item(row)
             if item.data(Qt.ItemDataRole.UserRole) == path:
-                item.setText(
-                    ("✓  " if success else "✗  ")
-                    + item.data(Qt.ItemDataRole.UserRole).split("\\")[-1].split("/")[-1]
-                )
+                name = Path(os.fspath(path)).name
+                item.setText(("✓  " if success else "✗  ") + name)
                 break
 
     def _set_busy(self, busy: bool) -> None:

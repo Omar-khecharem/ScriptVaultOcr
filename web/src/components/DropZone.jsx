@@ -1,8 +1,6 @@
 import { useRef, useState } from "react";
+import { UploadIcon } from "./icons.jsx";
 
-/**
- * Zone de glisser-déposer : accepte images + PDF, émet la liste des fichiers.
- */
 export default function DropZone({ onFiles }) {
   const inputRef = useRef(null);
   const [dragging, setDragging] = useState(false);
@@ -32,11 +30,22 @@ export default function DropZone({ onFiles }) {
         handleFiles(event.dataTransfer.files);
       }}
     >
-      <div className="icon">＋</div>
-      <div className="title">Glissez-déposez vos fichiers ici</div>
-      <div className="hint">
-        PNG · JPG · TIFF · WebP · PDF — ou cliquez pour parcourir
-      </div>
+      <span className="dz-ring">
+        <UploadIcon size={26} />
+      </span>
+      <span className="dz-title">Glissez-déposez vos documents ici</span>
+      <span className="dz-hint">PNG · JPG · TIFF · WebP · PDF — traitement 100% local</span>
+      <button
+        type="button"
+        className="btn btn-primary dz-btn"
+        onClick={(event) => {
+          event.stopPropagation();
+          inputRef.current?.click();
+        }}
+      >
+        <UploadIcon />
+        <span>Parcourir</span>
+      </button>
       <input
         ref={inputRef}
         type="file"

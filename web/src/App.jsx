@@ -12,13 +12,22 @@ import DropZone from "./components/DropZone.jsx";
 import EditorPanel from "./components/EditorPanel.jsx";
 import FileList from "./components/FileList.jsx";
 import ImageCanvas from "./components/ImageCanvas.jsx";
+import {
+  ChevronDownIcon,
+  DownloadIcon,
+  FileTextIcon,
+  MoonIcon,
+  PlayIcon,
+  SunIcon,
+  UploadIcon,
+  XIcon,
+} from "./components/icons.jsx";
 
 const CONCURRENCY = 2;
 
 let nextId = 0;
 
 export default function App() {
-  // --- État global ------------------------------------------------------
   const [theme, setTheme] = useState(() => localStorage.getItem("sv-theme") || "dark");
   const [files, setFiles] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
@@ -36,13 +45,11 @@ export default function App() {
   const cancelledRef = useRef(false);
   const fileInputRef = useRef(null);
 
-  // --- Thème ------------------------------------------------------------
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("sv-theme", theme);
   }, [theme]);
 
-  // --- Santé du serveur (polling pendant le pré-chargement) -------------
   useEffect(() => {
     let stop = false;
     async function poll() {
@@ -72,7 +79,6 @@ export default function App() {
     };
   }, []);
 
-  // --- Dérivés ----------------------------------------------------------
   const selected = useMemo(
     () => files.find((file) => file.id === selectedId) || null,
     [files, selectedId]
@@ -89,11 +95,13 @@ export default function App() {
     return { done: done.length, errors: errors.length, elapsed, confidence };
   }, [files]);
 
-  const hasPending = files.some((f) => f.status === "pending");
+const hasPending = files.some((f) => f.status === "pending");
   const editorText = selected?.editedText ?? selected?.result?.text ?? "";
-  const selectedPage = selected?.result?.pages?.[pageIndex] ?? null;
+  const pageCount = selected?.result?.pages?.length ?? 0;
+  const safePageIndex = pageCount > 0 ? Math.min(pageIndex, pageCount - 1) : 0;
+  const selectedPage = selected?.result?.pages?.[safePageIndex] ?? null;
+  const firstError = files.find((f) => f.status === "error")?.error ?? null;
 
-  // --- Actions ----------------------------------------------------------
   const addFiles = useCallback((fileList) => {
     const accepted = fileList.filter((file) => isSupportedFile(file.name));
     const rejected = fileList.length - accepted.length;
@@ -217,11 +225,23 @@ export default function App() {
     setPageIndex(0);
   }, []);
 
-  // --- Rendu ------------------------------------------------------------
   const canExport = Boolean(selected?.result?.text || selected?.editedText);
   const progressPct = files.length
     ? ((stats.done + stats.errors) / files.length) * 100
     : 0;
+  const elapsedLabel = stats.elapsed
+    ? stats.elapsed < 1000
+      ? `${Math.round(stats.elapsed)} ms`
+      : `${(stats.elapsed / 1000).toFixed(1)} s`
+    : "—";
+  const statusDot =
+    processing
+      ? "working"
+      : server.state === "offline"
+        ? "error"
+        : server.state === "ok"
+          ? "ok"
+          : "wait";
   const serverNotice =
     server.state === "offline"
       ? "Serveur indisponible — lancez python main.py dans backend/"
@@ -231,56 +251,79 @@ export default function App() {
 
   return (
     <>
-      <div className="topbar">
-        <span className="brand">ScriptVault OCR</span>
-        <select
-          aria-label="Langue"
-          value={lang}
-          onChange={(event) => setLang(event.target.value)}
-        >
-          {LANGS.map((code) => (
-            <option key={code} value={code}>
-              {code}
-            </option>
-          ))}
-        </select>
-        <label className="muted" title="CLAHE · redressement · binarisation">
-          <input
-            type="checkbox"
-            checked={preprocess}
-            onChange={(event) => setPreprocess(event.target.checked)}
-          />{" "}
-          Prétraitement
-        </label>
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark">SV</span>
+          <span className="brand-name">ScriptVault</span>
+          <span className="brand-tag">OCR</span>
+        </div>
+        <span className="tb-divider" />
+        <div className="tb-group">
+          <button
+            type="button"
+            className="btn"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={processing}
+            title="Ajouter des images ou des PDF"
+          >
+            <UploadIcon />
+            <span>Ajouter</span>
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={startOcr}
+            disabled={processing || !hasPending}
+            title="Lancer la reconnaissance du texte"
+          >
+            <PlayIcon size={14} />
+            <span>Démarrer l'OCR</span>
+          </button>
+          <button
+            type="button"
+            className="btn btn-danger"
+            onClick={cancelOcr}
+            disabled={!processing}
+            title="Annuler le traitement en cours"
+          >
+            <XIcon size={14} />
+            <span>Annuler</span>
+          </button>
+        </div>
         <span className="spacer" />
+        <div className="tb-group">
+          <label className="field" title="Langue du texte à reconnaître">
+            <span className="field-label">Langue</span>
+            <select value={lang} onChange={(event) => setLang(event.target.value)}>
+              {LANGS.map((code) => (
+                <option key={code} value={code}>
+                  {code}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label
+            className="switch"
+            title="CLAHE · redressement · binarisation"
+          >
+            <input
+              type="checkbox"
+              checked={preprocess}
+              onChange={(event) => setPreprocess(event.target.checked)}
+            />
+            <span className="switch-track" />
+            <span className="switch-text">Prétraitement</span>
+          </label>
+        </div>
+        <span className="tb-divider" />
+        <ExportMenu canExport={canExport} onExport={handleExport} />
         <button
           type="button"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={processing}
-        >
-          Ajouter des fichiers
-        </button>
-        <button type="button" className="primary" onClick={startOcr} disabled={processing || !hasPending}>
-          Démarrer l'OCR
-        </button>
-        <button type="button" className="danger" onClick={cancelOcr} disabled={!processing}>
-          Annuler
-        </button>
-        <span className="spacer" />
-        <button type="button" onClick={() => handleExport("txt")} disabled={!canExport}>
-          Exporter TXT
-        </button>
-        <button type="button" onClick={() => handleExport("docx")} disabled={!canExport}>
-          Exporter DOCX
-        </button>
-        <button type="button" onClick={() => handleExport("pdf")} disabled={!canExport}>
-          Exporter PDF
-        </button>
-        <button
-          type="button"
+          className="btn btn-icon"
           onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+          title={theme === "dark" ? "Passer au thème clair" : "Passer au thème sombre"}
         >
-          {theme === "dark" ? "Thème clair" : "Thème sombre"}
+          {theme === "dark" ? <SunIcon /> : <MoonIcon />}
         </button>
         <input
           ref={fileInputRef}
@@ -293,36 +336,25 @@ export default function App() {
             event.target.value = "";
           }}
         />
-      </div>
+      </header>
 
-      <div className="split">
-        <div className="card left">
-          <h3>Document</h3>
-          {files.length === 0 ? (
-            <DropZone onFiles={addFiles} />
-          ) : (
-            <>
-              <ImageCanvas
-                previewUrl={selectedPage?.preview || null}
-                boxes={
-                  selectedPage
-                    ? selectedPage.items.map((item) => ({
-                        box: item.box,
-                        text: item.text,
-                        confidence: item.confidence,
-                      }))
-                    : []
-                }
-                message="Analyse en cours ou fichier non traité…"
-              />
+      <main className="app-main">
+        <div className="split">
+          <section className="card card-left">
+            <div className="card-head">
+              <h2 className="card-title">Document</h2>
+              {selected && <span className="card-count">{shortName(selected.name)}</span>}
+              <span className="spacer" />
               {selected?.result?.pages?.length > 1 && (
-                <div className="toolbar-row muted">
-                  Pages :
+                <div className="pages" role="tablist" aria-label="Sélection de page">
+                  <span className="page-label">Pages</span>
                   {selected.result.pages.map((page) => (
                     <button
                       key={page.page}
                       type="button"
-                      className={`toolbtn${page.page - 1 === pageIndex ? " active" : ""}`}
+                      role="tab"
+                      aria-selected={page.page - 1 === safePageIndex}
+                      className={`page-btn${page.page - 1 === safePageIndex ? " active" : ""}`}
                       onClick={() => setPageIndex(page.page - 1)}
                     >
                       {page.page}
@@ -330,40 +362,150 @@ export default function App() {
                   ))}
                 </div>
               )}
-            </>
-          )}
-          <h3>Fichiers ({files.length})</h3>
-          <FileList files={files} selectedId={selectedId} onSelect={selectFile} />
+            </div>
+            <div className="card-body">
+              {files.length === 0 ? (
+                <DropZone onFiles={addFiles} />
+              ) : (
+                <ImageCanvas
+                  previewUrl={selectedPage?.preview || null}
+                  boxes={
+                    selectedPage
+                      ? selectedPage.items.map((item) => ({
+                          box: item.box,
+                          text: item.text,
+                          confidence: item.confidence,
+                        }))
+                      : []
+                  }
+                  message="Analyse en cours ou fichier non traité…"
+                />
+              )}
+            </div>
+            <div className="card-foot">
+              <div className="card-foot-head">
+                <h2 className="card-title">Fichiers</h2>
+                {files.length > 0 && <span className="card-count">{files.length}</span>}
+              </div>
+              <FileList files={files} selectedId={selectedId} onSelect={selectFile} />
+            </div>
+          </section>
+
+          <EditorPanel
+            fileKey={selectedId ?? "empty"}
+            text={editorText}
+            placeholder={
+              selected?.result?.text == null && selected?.editedText == null
+                ? "Ce fichier n'a pas encore été analysé."
+                : undefined
+            }
+            onChange={handleEditorChange}
+          />
         </div>
+      </main>
 
-        <EditorPanel
-          fileKey={selectedId ?? "empty"}
-          text={editorText}
-          placeholder={
-            selected?.result?.text == null && selected?.editedText == null
-              ? "Ce fichier n'a pas encore été analysé."
-              : undefined
-          }
-          onChange={handleEditorChange}
-        />
-      </div>
-
-      <div className="statusbar">
+      <footer className="statusbar">
+        <span className="status-dot" data-state={statusDot} />
         <span className="status-text">
           {statusText}
-          {serverNotice && <span className="notice info" style={{ marginLeft: 8 }}>{serverNotice}</span>}
+          {serverNotice && (
+            <span className="notice info">{serverNotice}</span>
+          )}
+          {firstError && !processing && (
+            <span className="notice error" title={firstError}>
+              {firstError}
+            </span>
+          )}
         </span>
-        <span className="mono">Temps : {stats.elapsed ? `${stats.elapsed.toFixed(0)} ms` : "—"}</span>
-        <span className="mono">
-          {stats.done} / {files.length}
-        </span>
-        <div className="progress" role="progressbar" aria-valuenow={Math.round(progressPct)}>
+        <span className="spacer" />
+        <div className="stat-chip">
+          Fichiers <span className="stat-value">{stats.done}/{files.length}</span>
+        </div>
+        <div className="stat-chip">
+          Temps <span className="stat-value mono">{elapsedLabel}</span>
+        </div>
+        <div
+          className="progress"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(progressPct)}
+        >
           <div className="bar" style={{ width: `${progressPct}%` }} />
         </div>
         <ConfidenceGauge
           value={stats.confidence == null ? null : stats.confidence * 100}
         />
-      </div>
+      </footer>
     </>
   );
+}
+
+function ExportMenu({ canExport, onExport }) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    function handlePointer(event) {
+      if (menuRef.current && !menuRef.current.contains(event.target)) setOpen(false);
+    }
+    function handleKey(event) {
+      if (event.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", handlePointer);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handlePointer);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [open]);
+
+  const formats = [
+    { id: "txt", label: "TXT — texte brut" },
+    { id: "docx", label: "DOCX — Word" },
+    { id: "pdf", label: "PDF — document" },
+  ];
+
+  return (
+    <div className="export-menu" ref={menuRef}>
+      <button
+        type="button"
+        className="btn"
+        onClick={() => setOpen((value) => !value)}
+        disabled={!canExport}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title="Exporter le texte corrigé"
+      >
+        <DownloadIcon />
+        <span>Exporter</span>
+        <ChevronDownIcon size={14} />
+      </button>
+      {open && (
+        <div className="export-pop" role="menu">
+          <div className="pop-title">Formats d'export</div>
+          {formats.map((format) => (
+            <button
+              key={format.id}
+              type="button"
+              role="menuitem"
+              className="export-item"
+              onClick={() => {
+                setOpen(false);
+                onExport(format.id);
+              }}
+            >
+              <FileTextIcon />
+              {format.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function shortName(name, max = 30) {
+  return name.length > max ? `${name.slice(0, max - 1)}…` : name;
 }

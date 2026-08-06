@@ -1,25 +1,37 @@
 import { useEffect, useRef, useState } from "react";
+import {
+  EyeIcon,
+  EyeOffIcon,
+  ImageIcon,
+  MaximizeIcon,
+  ZoomInIcon,
+  ZoomOutIcon,
+} from "./icons.jsx";
 
-/** Couleur de boîte selon la confiance (identique au desktop). */
 export function boxColor(confidence) {
-  if (confidence >= 0.85) return "#2ECC71";
-  if (confidence >= 0.6) return "#F5A524";
-  return "#E5484D";
+  if (confidence >= 0.85) return "#34d399";
+  if (confidence >= 0.6) return "#fbbf24";
+  return "#f87171";
 }
 
-/**
- * Visualiseur d'image avec zoom (molette), déplacement (glisser) et
- * superposition des boîtes OCR. Les boîtes sont dessinées sur l'image
- * *telle qu'analysée par le serveur* (prévisualisation PNG) : l'alignement
- * est donc parfait, même après deskew/binarisation.
- */
+function roundRect(ctx, x, y, w, h, radius) {
+  if (typeof ctx.roundRect === "function") {
+    ctx.roundRect(x, y, w, h, radius);
+  } else {
+    ctx.rect(x, y, w, h);
+  }
+}
+
 export default function ImageCanvas({ previewUrl, boxes = [], message }) {
   const canvasRef = useRef(null);
-  const imageRef = useRef(null); // HTMLImageElement chargée
+  const imageRef = useRef(null);
   const [view, setView] = useState({ scale: 1, x: 0, y: 0 });
+  const [showBoxes, setShowBoxes] = useState(true);
   const dragRef = useRef(null);
 
-  // Charge la prévisualisation (reset de la vue à chaque nouveau document).
+  const visibleBoxes = showBoxes ? boxes : [];
+  const zoomPct = Math.round(view.scale * 100);
+
   useEffect(() => {
     imageRef.current = null;
     setView({ scale: 1, x: 0, y: 0 });
@@ -36,11 +48,10 @@ export default function ImageCanvas({ previewUrl, boxes = [], message }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [previewUrl]);
 
-  // Redessine à chaque changement d'état de la vue.
   useEffect(() => {
     draw();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, boxes, previewUrl]);
+  }, [view, visibleBoxes, previewUrl]);
 
   function draw() {
     const canvas = canvasRef.current;
@@ -55,7 +66,6 @@ export default function ImageCanvas({ previewUrl, boxes = [], message }) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, rect.width, rect.height);
 
-    // Mise à l'échelle pour tenir dans le cadre (avec marge).
     const margin = 8;
     const availW = Math.max(1, rect.width - 2 * margin);
     const availH = Math.max(1, rect.height - 2 * margin);
@@ -68,8 +78,7 @@ export default function ImageCanvas({ previewUrl, boxes = [], message }) {
 
     ctx.drawImage(img, x0, y0, drawW, drawH);
 
-    // Superposition des boîtes.
-    for (const item of boxes) {
+    for (const item of visibleBoxes) {
       const { box, text, confidence } = item;
       if (!box || box.length < 3) continue;
       ctx.beginPath();
@@ -84,7 +93,6 @@ export default function ImageCanvas({ previewUrl, boxes = [], message }) {
       ctx.lineWidth = 2;
       ctx.stroke();
 
-      // Étiquette texte au-dessus de la boîte (si assez zoomé).
       if (text && view.scale >= 0.5) {
         const [bx, by] = box[0];
         const labelX = x0 + bx * scale;
@@ -93,7 +101,7 @@ export default function ImageCanvas({ previewUrl, boxes = [], message }) {
         const textW = ctx.measureText(text).width;
         ctx.fillStyle = "rgba(0, 0, 0, 0.75)";
         ctx.beginPath();
-        ctx.roundRect(labelX, labelY - 19, textW + 10, 16, 4);
+        roundRect(ctx, labelX, labelY - 19, textW + 10, 16, 4);
         ctx.fill();
         ctx.fillStyle = "#FFFFFF";
         ctx.fillText(text, labelX + 5, labelY - 7);
@@ -140,10 +148,26 @@ export default function ImageCanvas({ previewUrl, boxes = [], message }) {
     event.currentTarget.style.cursor = "";
   }
 
+  function zoomBy(factor) {
+    setView((prev) => ({
+      ...prev,
+      scale: Math.min(10, Math.max(0.25, prev.scale * factor)),
+    }));
+  }
+
+  function resetView() {
+    setView({ scale: 1, x: 0, y: 0 });
+  }
+
   if (!previewUrl) {
     return (
       <div className="canvas-wrap">
-        <div className="canvas-placeholder">{message || "Sélectionnez un fichier pour afficher le document"}</div>
+        <div className="canvas-placeholder">
+          <span className="ph-ring">
+            <ImageIcon size={22} />
+          </span>
+          <span>{message || "Sélectionnez un fichier pour afficher le document"}</span>
+        </div>
       </div>
     );
   }
@@ -158,6 +182,48 @@ export default function ImageCanvas({ previewUrl, boxes = [], message }) {
       onMouseLeave={onMouseUp}
     >
       <canvas ref={canvasRef} />
+      <div
+        className="canvas-tools"
+        role="toolbar"
+        aria-label="Zoom et affichage"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <button
+          type="button"
+          className="canvas-tool"
+          onClick={() => zoomBy(1.25)}
+          title="Zoom avant"
+        >
+          <ZoomInIcon />
+        </button>
+        <span className="canvas-zoom">{zoomPct}%</span>
+        <button
+          type="button"
+          className="canvas-tool"
+          onClick={() => zoomBy(0.8)}
+          title="Zoom arrière"
+        >
+          <ZoomOutIcon />
+        </button>
+        <button
+          type="button"
+          className="canvas-tool"
+          onClick={resetView}
+          title="Ajuster la vue"
+        >
+          <MaximizeIcon />
+        </button>
+        <span className="canvas-sep" />
+        <button
+          type="button"
+          className={`canvas-tool${showBoxes ? " active" : ""}`}
+          onClick={() => setShowBoxes((value) => !value)}
+          title={showBoxes ? "Masquer les boîtes OCR" : "Afficher les boîtes OCR"}
+        >
+          {showBoxes ? <EyeIcon /> : <EyeOffIcon />}
+        </button>
+      </div>
+      <span className="canvas-hint">Molette : zoom · Glisser : déplacer</span>
     </div>
   );
 }

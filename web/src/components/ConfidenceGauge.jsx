@@ -1,39 +1,51 @@
-/**
- * Jauge de confiance circulaire (SVG) — % moyen des fichiers traités.
- */
 export default function ConfidenceGauge({ value }) {
   const pct = value == null ? null : Math.max(0, Math.min(100, value));
-  const circumference = 2 * Math.PI * 26;
-  const color = pct == null ? "var(--muted)" : pct >= 70 ? "var(--success)" : pct >= 50 ? "var(--warning)" : "var(--danger)";
+  const R = 26;
+  const C = 2 * Math.PI * R;
+  const color =
+    pct == null
+      ? "var(--muted)"
+      : pct >= 70
+        ? "var(--success)"
+        : pct >= 50
+          ? "var(--warning)"
+          : "var(--danger)";
 
   return (
-    <svg className="gauge" width="70" height="70" viewBox="0 0 70 70" role="img" aria-label="Confiance moyenne">
+    <svg
+      className="gauge"
+      width="58"
+      height="58"
+      viewBox="0 0 58 58"
+      role="img"
+      aria-label="Confiance moyenne"
+    >
       <circle
-        cx="35"
-        cy="35"
-        r="26"
+        className="track"
+        cx="29"
+        cy="29"
+        r={R}
         fill="none"
-        stroke="var(--surface-alt)"
         strokeWidth="7"
         strokeLinecap="round"
-        strokeDasharray={`${circumference * 0.75} ${circumference}`}
-        transform="rotate(135 35 35)"
+        strokeDasharray={`${C * 0.75} ${C}`}
+        transform="rotate(135 29 29)"
       />
       {pct != null && (
         <circle
-          cx="35"
-          cy="35"
-          r="26"
+          className="value"
+          cx="29"
+          cy="29"
+          r={R}
           fill="none"
           stroke={color}
           strokeWidth="7"
           strokeLinecap="round"
-          strokeDasharray={`${circumference * 0.75 * (pct / 100)} ${circumference}`}
-          transform="rotate(135 35 35)"
-          style={{ transition: "stroke-dasharray 0.3s ease" }}
+          strokeDasharray={`${(C * 0.75 * pct) / 100} ${C}`}
+          transform="rotate(135 29 29)"
         />
       )}
-      <text x="35" y="40">
+      <text x="29" y="33.5">
         {pct == null ? "—" : `${Math.round(pct)}%`}
       </text>
     </svg>

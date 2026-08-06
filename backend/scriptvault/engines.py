@@ -1,45 +1,154 @@
-"""Gestion du cycle de vie des moteurs OCR côté serveur.
+"""Gestion du cycle de vie des moteurs OCR côté serveur — scalable & Air-Gapped.
 
-PaddleOCR n'est **pas thread-safe** : une instance ne peut être utilisée que
-par un seul thread à la fois. Le serveur FastAPI est asynchrone et peut donc
-recevoir des requêtes concurrentes — c'est le rôle de :class:`EngineManager`
-de garantir l'exclusion mutuelle.
+Le moteur PaddleOCR n'est pas thread-safe : une instance ne sert qu'une
+requête à la fois. Deux modes d'exécution sont proposés :
 
-Principe (pool round-robin) :
+**Mode ``process`` (défaut)**
+    Un :class:`ProcessPoolExecutor` de ``settings.workers`` workers (0 = auto,
+    borné au nombre de cœurs ``os.cpu_count()``) est créé. Chaque worker porte
+    **son propre moteur OCR** (un modèle complet en RAM par worker). Le
+    Warm-start est effectué à l'initialisation : les poids des modèles sont
+    chargés en mémoire dès le démarrage du serveur, depuis le répertoire local
+    bundlé ``models/`` — fonctionnement 100 % hors-ligne, sans aucune
+    dépendance cloud.
 
-* Pour chaque langue, un pool de ``max_concurrency`` instances est créé
-  paresseusement. Chaque instance est **pinnée** sur son propre
-  ``ThreadPoolExecutor(max_workers=1)`` : l'inférence d'un moteur s'exécute
-  donc toujours sur le même thread, ce qui est la seule configuration sûre
-  pour PaddlePaddle.
-* Les requêtes asynchrones piochent le prochain moteur libre dans une
-  ``asyncio.Queue`` ; si tous les moteurs sont occupés, elles attendent.
-* Un délai maximal par inférence est appliqué (``asyncio.wait_for``). En cas
-  de dépassement, le moteur est considéré comme instable et remplacé.
-* Le pool est "chaud" : la première requête déclenche le chargement des poids
-  (lent), les suivantes sont instantanées. ``preload=True`` déclenche le
-  chargement dès le démarrage du serveur, en arrière-plan.
+**Mode ``thread`` (repli)** : activé automatiquement si la fabrique de moteur
+    injectée n'est pas picklable (cas des tests), ou si
+    ``SCRIPTVAULT_USE_PROCESSES=false``. Un pool round-robin de slots, chaque
+    slot étant pinné sur un ``ThreadPoolExecutor(max_workers=1)`` (Paddle n'est
+    pas thread-safe).
+
+Les obstacles : parallélisme = nombre de workers ; les requêtes asynchrones
+sont mises en file et une limite de temps par inférence est appliquée
+(``timeout_ms`` → ``TimeoutError`` → HTTP 504).
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import multiprocessing
+import os
+import pickle
+import platform
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
-import numpy as np
-
 from .config import Settings
-from .core_ocr import LocalOCREngine
+from .core_ocr import (
+    ImagePreprocessor,
+    LocalOCREngine,
+    OCRInitError,
+    OCRResultItem,
+    PageResult,
+    ROIProfile,
+    make_page_result,
+)
 
 logger = logging.getLogger("scriptvault.engines")
 
 EngineFactory = Callable[[], Any]
 
+# Plafond par défaut du nombre de workers OCR (mémoire ~1-2 Go par instance).
+_WORKER_CAP = 8
 
+# --------------------------------------------------------------------------- #
+# État global du processus worker (un seul moteur par worker)
+# --------------------------------------------------------------------------- #
+_WORKER_ENGINE: Any = None
+_WORKER_INIT_ERROR: Optional[BaseException] = None
+
+
+def _worker_init(factory: EngineFactory) -> None:
+    """Initialiseur de worker : construit le moteur et force le warm-up.
+
+    Exécuté dans le contexte du worker par ``ProcessPoolExecutor``
+    (``initializer``). Le warm-up matérialise les poids des modèles en RAM —
+    c'est le Warm-start.
+    """
+    global _WORKER_ENGINE, _WORKER_INIT_ERROR
+    _WORKER_INIT_ERROR = None
+    try:
+        _WORKER_ENGINE = factory()
+        warm_up = getattr(_WORKER_ENGINE, "warm_up", None)
+        if callable(warm_up):
+            warm_up()
+        logger.info(
+            "Worker %d prêt: moteur %r chargé en mémoire.",
+            os.getpid(),
+            type(_WORKER_ENGINE).__name__,
+        )
+    except Exception as exc:
+        _WORKER_INIT_ERROR = exc
+        _WORKER_ENGINE = None
+        logger.error("Échec du warm-up worker %d: %s", os.getpid(), exc)
+
+
+def _worker_warmup() -> str:
+    """Tâche barrière : confirme que le worker a initialisé son moteur."""
+    if _WORKER_ENGINE is None:
+        return f"worker-{os.getpid()}-vide"
+    return f"worker-{os.getpid()}-{type(_WORKER_ENGINE).__name__}"
+
+
+def _worker_call(method: str, arg: Any, kwargs: dict[str, Any]) -> Any:
+    """Routeur principal : appelle ``engine.method(arg, **kwargs)`` dans le worker."""
+    if _WORKER_INIT_ERROR is not None:
+        raise OCRInitError(
+            f"Worker OCR non initialisé: {_WORKER_INIT_ERROR}"
+        ) from _WORKER_INIT_ERROR
+    if _WORKER_ENGINE is None:
+        raise OCRInitError("Worker OCR non initialisé.")
+    fn = getattr(_WORKER_ENGINE, method, None)
+    if fn is None:
+        raise RuntimeError(f"Le moteur du worker ne fournit pas {method!r}.")
+    return fn(arg, **kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# Fabrique par défaut du moteur (module-level -> picklable, spawn-safe)
+# --------------------------------------------------------------------------- #
+def _default_engine_factory(settings: Settings) -> Any:
+    """Construit le moteur OCR serveur (100 % local, weights du dossier models/)."""
+    return LocalOCREngine(
+        lang=settings.lang,
+        model_dir=settings.model_dir,
+        cpu_threads=settings.cpu_threads,
+        preprocess_kwargs={"binarize": settings.preprocess},
+        max_side_len=settings.max_side_len or None,
+        barcode=settings.barcode_enabled,
+        barcode_budget_ms=float(settings.barcode_budget_ms),
+        enable_roi=settings.roi_enabled,
+    )
+
+
+def _resolve_workers(settings: Settings) -> int:
+    """Nombre de workers : ``SCRIPTVAULT_WORKERS`` si > 0, sinon 1.
+
+    Chaque worker charge ses propres poids de modèles en RAM (~1-2 Go par
+    instance) : le défaut est volontairement conservateur pour ne pas saturer
+    la machine. Passez ``SCRIPTVAULT_WORKERS`` (plafond 8) pour paralléliser.
+    """
+    if settings.workers > 0:
+        return max(1, min(settings.workers, _WORKER_CAP))
+    return 1
+
+
+def _is_picklable(obj: Any) -> bool:
+    """Vrai si l'objet est sérialisable (requis pour le mode process)."""
+    try:
+        pickle.dumps(obj)
+        return True
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Repli thread (moteurs non picklables : tests) et dispatch de tâches
+# --------------------------------------------------------------------------- #
 class _EngineSlot:
     """Un moteur OCR et le thread unique qui l'exécute."""
 
@@ -61,14 +170,58 @@ class _EngineSlot:
         self.executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _thread_dispatch(engine: Any, method: str, arg: Any, kwargs: dict[str, Any]) -> Any:
+    """Exécute une méthode sur le moteur du slot (mode thread).
+
+    Repli : si le moteur (ex. fabrique factice) ne fournit pas
+    ``predict_pages_bytes``, on décompose le fichier (TIFF multi-pages inclus)
+    via :class:`ImagePreprocessor` et on appelle ``predict_array`` par page.
+    """
+    fn = getattr(engine, method, None)
+    if fn is not None:
+        return fn(arg, **kwargs)
+    if method == "predict_pages_bytes":
+        return _thread_predict_pages_fallback(
+            engine, arg, bool(kwargs.get("preprocess", True))
+        )
+    raise AttributeError(f"Le moteur ne fournit pas la méthode {method!r}.")
+
+
+def _thread_predict_pages_fallback(
+    engine: Any, data: bytes, preprocess: bool
+) -> list[PageResult]:
+    """Repli multipage : lecture TIFF multi-pages + OCR ``predict_array`` par page."""
+    preprocessor = ImagePreprocessor()
+    images = preprocessor.read_pages_bytes(data)
+    results: list[PageResult] = []
+    for index, page in enumerate(images, start=1):
+        started = time.perf_counter()
+        processed = preprocessor.preprocess(page, binarize=True) if preprocess else page
+        height, width = processed.shape[:2]
+        items = engine.predict_array(processed, preprocess=False)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        results.append(
+            make_page_result(index, width, height, items, elapsed_ms, [], processed)
+        )
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# Gestionnaire de pool
+# --------------------------------------------------------------------------- #
 class EngineManager:
-    """Pool thread-safe de moteurs OCR, indexé par langue.
+    """Pool scalable de moteurs OCR, indexé par langue.
+
+    Modes:
+    * ``process`` — :class:`ProcessPoolExecutor`, un moteur par worker,
+      Warm-start au démarrage, s'adapte au nombre de cœurs.
+    * ``thread`` — slots round-robin pinnés sur leur propre thread (repli
+      pour les fabriques non picklables / ``SCRIPTVAULT_USE_PROCESSES=false``).
 
     Args:
-        settings: Configuration du serveur.
+        settings: Configuration serveur.
         engine_factory: Fabrique optionnelle de moteur (injectable pour les
-            tests). Par défaut, construit :class:`LocalOCREngine` avec la
-            configuration du serveur.
+            tests). Doit être picklable pour le mode process.
     """
 
     def __init__(
@@ -77,28 +230,39 @@ class EngineManager:
         engine_factory: Optional[EngineFactory] = None,
     ) -> None:
         self._settings = settings
-        self._factory: EngineFactory = engine_factory or self._default_factory
+        self._factory: EngineFactory = (
+            engine_factory
+            if engine_factory is not None
+            else functools.partial(_default_engine_factory, settings)
+        )
+        self._use_processes = settings.use_processes and _is_picklable(self._factory)
+        self._mode = "process" if self._use_processes else "thread"
+        self._workers = _resolve_workers(settings)
+        logger.info(
+            "Mode de pool sélectionné: %s (workers=%d).",
+            self._mode,
+            self._workers,
+        )
+
+        self._pool: Optional[ProcessPoolExecutor] = None
         self._slots: dict[str, list[_EngineSlot]] = {}
         self._queues: dict[str, asyncio.Queue[_EngineSlot]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._preload_thread: Optional[threading.Thread] = None
+        self._warmup_thread: Optional[threading.Thread] = None
+        self._warmup_futures: list[Future[Any]] = []
+        self._preloading = False
         self._started_at = time.monotonic()
         self._closed = False
 
     # ------------------------------------------------------------------ #
     # Construction
     # ------------------------------------------------------------------ #
-    def _default_factory(self) -> Any:
-        settings = self._settings
-        return LocalOCREngine(
-            lang=settings.lang,
-            model_dir=settings.model_dir,
-            cpu_threads=settings.cpu_threads,
-            preprocess_kwargs={"binarize": settings.preprocess},
-        )
-
     async def start(self) -> None:
-        """Initialise le pool (pré-chargement éventuel en arrière-plan)."""
+        """Initialise le pool (Warm-start des modèles au démarrage)."""
+        if self._mode == "process":
+            self._ensure_pool()
+            return
         if self._settings.preload:
             self._preload_thread = threading.Thread(
                 target=self._warmup_sync,
@@ -107,12 +271,53 @@ class EngineManager:
             )
             self._preload_thread.start()
 
-    def _warmup_sync(self) -> None:
-        """Charge le moteur par défaut hors du thread asyncio (démarrage rapide).
+    def _ensure_pool(self) -> None:
+        """Crée le pool process (une fois) et déclenche le Warm-start si configuré."""
+        if self._pool is not None:
+            return
+        if platform.system() == "Windows":
+            context: multiprocessing.context.BaseContext = multiprocessing.get_context(
+                "spawn"
+            )
+        else:
+            context = multiprocessing.get_context("fork")
+        self._pool = ProcessPoolExecutor(
+            max_workers=self._workers,
+            mp_context=context,
+            initializer=_worker_init,
+            initargs=(self._factory,),
+        )
+        if self._settings.preload:
+            self._preloading = True
+            self._warmup_thread = threading.Thread(
+                target=self._warmup_pool,
+                name="scriptvault-warmup",
+                daemon=True,
+            )
+            self._warmup_thread.start()
 
-        L'instance créée est immédiatement disponible pour le pool (elle n'est
-        pas marquée occupée).
-        """
+    def _warmup_pool(self) -> None:
+        """Pré-charge chaque worker (modèles en RAM) avant service des requêtes."""
+        pool = self._pool
+        if pool is None:
+            self._preloading = False
+            return
+        try:
+            futures = [pool.submit(_worker_warmup) for _ in range(self._workers)]
+            self._warmup_futures = futures
+            for future in futures:
+                future.result(timeout=1800)
+            self._preloading = False
+            logger.info(
+                "Warm-start terminé: %d worker(s) OCR prêts (modèles en RAM).",
+                self._workers,
+            )
+        except Exception as exc:
+            self._preloading = False
+            logger.warning("Warm-start partiel (certains workers en échec): %s", exc)
+
+    def _warmup_sync(self) -> None:
+        """Mode thread : charge le moteur par défaut hors du loop asyncio."""
         try:
             lang = self._settings.lang
             engine = self._factory()
@@ -129,19 +334,29 @@ class EngineManager:
                 exc,
             )
 
+    # ------------------------------------------------------------------ #
+    # Mode thread : pool round-robin
+    # ------------------------------------------------------------------ #
     async def _acquire_slot(self, lang: str) -> _EngineSlot:
-        """Retourne un moteur libre pour ``lang`` (en crée si le pool n'est
-        pas plein, sinon attend la libération d'un moteur)."""
+        """Retourne un moteur libre (en crée un si quota, sinon attend).
+
+        Invariant : la file contient exactement les slots libres ; un slot
+        occupé est retiré de la file pendant l'exécution, ce qui garantit
+        qu'aucune requête n'obtient deux fois le même moteur simultanément.
+        """
         lock = self._locks.setdefault(lang, asyncio.Lock())
         queue = self._queues.setdefault(
             lang, asyncio.Queue(maxsize=self._settings.max_concurrency)
         )
         async with lock:
             slots = self._slots.setdefault(lang, [])
-            # Remplit le pool tant qu'il reste de la place : les moteurs
-            # disponibles sont mis dans la file, les occupés restent à part.
-            while queue.empty() and len(slots) < self._settings.max_concurrency:
-                engine = self._factory()
+            if queue.empty() and len(slots) < self._settings.max_concurrency:
+                try:
+                    engine = self._factory()
+                except Exception as exc:
+                    raise OCRInitError(
+                        f"Échec de l'initialisation du moteur OCR ({lang}): {exc}"
+                    ) from exc
                 slot = _EngineSlot(engine)
                 slots.append(slot)
                 queue.put_nowait(slot)
@@ -151,17 +366,70 @@ class EngineManager:
                     len(slots),
                     self._settings.max_concurrency,
                 )
-            # Récupère les moteurs disponibles créés par des requêtes
-            # précédentes (cas pré-chargement ou pool déjà plein).
-            for slot in slots:
-                if not slot.busy and queue.qsize() < self._settings.max_concurrency:
-                    queue.put_nowait(slot)
-        return await queue.get()
+        slot = await queue.get()
+        slot.busy = True
+        return slot
 
     async def _release_slot(self, lang: str, slot: _EngineSlot) -> None:
+        slot.busy = False
         queue = self._queues.get(lang)
         if queue is not None:
             await queue.put(slot)
+
+    # ------------------------------------------------------------------ #
+    # Exécution des requêtes
+    # ------------------------------------------------------------------ #
+    async def _predict(
+        self,
+        lang: str,
+        method: str,
+        arg: Any,
+        *,
+        preprocess: Optional[bool] = None,
+        rois: Optional[ROIProfile] = None,
+        scan_barcode: Optional[bool] = None,
+    ) -> Any:
+        if self._closed:
+            raise RuntimeError("Le gestionnaire de moteurs est fermé.")
+        kwargs: dict[str, Any] = {}
+        if preprocess is not None:
+            kwargs["preprocess"] = preprocess
+        if rois is not None:
+            kwargs["rois"] = rois
+        if scan_barcode is not None:
+            kwargs["scan_barcode"] = scan_barcode
+
+        if self._mode == "process":
+            self._ensure_pool()
+            pool = self._pool
+            if pool is None:
+                raise RuntimeError("Pool de workers indisponible.")
+            future = asyncio.wrap_future(pool.submit(_worker_call, method, arg, kwargs))
+            return await self._await_result(future, lang)
+        slot = await self._acquire_slot(lang)
+        try:
+            future = asyncio.wrap_future(
+                slot.executor.submit(_thread_dispatch, slot.engine, method, arg, kwargs)
+            )
+            return await self._await_result(future, lang)
+        finally:
+            await self._release_slot(lang, slot)
+
+    async def _await_result(self, future: Any, lang: str) -> Any:
+        timeout = self._settings.timeout_ms / 1000.0
+        try:
+            if timeout > 0:
+                return await asyncio.wait_for(future, timeout=timeout)
+            return await future
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Inférence OCR dépassée pour %r (%s ms).",
+                lang,
+                self._settings.timeout_ms,
+            )
+            raise TimeoutError(
+                f"Inférence OCR dépassée ({self._settings.timeout_ms} ms)."
+            ) from None
 
     # ------------------------------------------------------------------ #
     # API publique (asynchrone)
@@ -172,73 +440,89 @@ class EngineManager:
         *,
         lang: Optional[str] = None,
         preprocess: Optional[bool] = None,
-    ) -> list[dict[str, Any]]:
-        """Reconnaît le texte d'une image encodée (octets bruts)."""
+    ) -> list[OCRResultItem]:
+        """Reconnaît le texte d'une image encodée (première page si TIF)."""
         lang = lang or self._settings.lang
-        return await self._predict(lang, "predict_bytes", data, preprocess)
+        return await self._predict(lang, "predict_bytes", data, preprocess=preprocess)
 
     async def predict_array(
         self,
-        image: np.ndarray,
+        image: Any,
         *,
         lang: Optional[str] = None,
         preprocess: Optional[bool] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[OCRResultItem]:
         """Reconnaît le texte d'une image numpy (page PDF rastérisée)."""
         lang = lang or self._settings.lang
-        return await self._predict(lang, "predict_array", image, preprocess)
+        return await self._predict(lang, "predict_array", image, preprocess=preprocess)
 
-    async def _predict(
+    async def predict_pages_bytes(
         self,
-        lang: str,
-        method: str,
-        arg: bytes | np.ndarray,
-        preprocess: Optional[bool],
-    ) -> list[dict[str, Any]]:
-        if self._closed:
-            raise RuntimeError("Le gestionnaire de moteurs est fermé.")
-        slot = await self._acquire_slot(lang)
-        try:
-            callable_method = getattr(slot.engine, method)
-            kwargs: dict[str, Any] = {}
-            if preprocess is not None:
-                kwargs["preprocess"] = preprocess
-            future = asyncio.wrap_future(
-                slot.executor.submit(callable_method, arg, **kwargs)
-            )
-            timeout = self._settings.timeout_ms / 1000.0
-            try:
-                if timeout > 0:
-                    return await asyncio.wait_for(future, timeout=timeout)
-                return await future
-            except asyncio.TimeoutError:
-                raise TimeoutError(
-                    f"Inférence OCR dépassée ({self._settings.timeout_ms} ms)."
-                ) from None
-        finally:
-            await self._release_slot(lang, slot)
+        data: bytes,
+        *,
+        lang: Optional[str] = None,
+        preprocess: Optional[bool] = None,
+        rois: Optional[ROIProfile] = None,
+        scan_barcode: Optional[bool] = None,
+    ) -> list[PageResult]:
+        """Analyse **toutes** les pages d'un fichier image (TIF multi-pages).
 
+        Lecture hybride : code-barres/QR locaux puis OCR global, ou recettes
+        par zones d'intérêt (``rois``) si un profil de formulaire est fourni.
+        Chaque :class:`PageResult` embarque l'image exactement analysée
+        (prétraitée, zones masquées) — prête pour l'overlay web.
+        """
+        lang = lang or self._settings.lang
+        return await self._predict(
+            lang,
+            "predict_pages_bytes",
+            data,
+            preprocess=preprocess,
+            rois=rois,
+            scan_barcode=scan_barcode,
+        )
+
+    # ------------------------------------------------------------------ #
+    # État
+    # ------------------------------------------------------------------ #
     async def health(self) -> dict[str, Any]:
         """État du pool pour l'endpoint de santé."""
-        engines: dict[str, Any] = {}
-        for lang, slots in self._slots.items():
-            engines[lang] = {
-                "instances": len(slots),
-                "ready": all(
-                    bool(getattr(slot.engine, "is_ready", True)) for slot in slots
-                ),
+        if self._mode == "process":
+            engines: dict[str, Any] = {
+                self._settings.lang: {
+                    "instances": self._workers,
+                    "ready": not self._preloading,
+                    "mode": "process",
+                }
             }
+        else:
+            engines = {}
+            for lang, slots in self._slots.items():
+                engines[lang] = {
+                    "instances": len(slots),
+                    "ready": all(
+                        bool(getattr(slot.engine, "is_ready", True)) for slot in slots
+                    ),
+                    "mode": "thread",
+                }
         return {
-            "preloading": (
-                self._preload_thread is not None and self._preload_thread.is_alive()
-            ),
+            "mode": self._mode,
+            "preloading": self._preloading,
             "engines": engines,
+            "workers": self._workers if self._mode == "process" else None,
             "uptime_s": round(time.monotonic() - self._started_at, 1),
         }
 
     async def close(self) -> None:
-        """Libère tous les moteurs et leurs threads."""
+        """Libère tous les workers, moteurs et threads."""
         self._closed = True
+        self._preloading = False
+        if self._pool is not None:
+            try:
+                self._pool.shutdown(wait=False, cancel_futures=True)
+            except Exception as exc:  # pragma: no cover - défensif
+                logger.warning("Arrêt du pool en erreur: %s", exc)
+            self._pool = None
         for slots in self._slots.values():
             for slot in slots:
                 slot.shutdown()

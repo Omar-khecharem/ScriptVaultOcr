@@ -1,6 +1,5 @@
-/**
- * Liste des fichiers ajoutés avec leur statut (attente / analyse / OK / erreur).
- */
+import { CheckIcon, XIcon } from "./icons.jsx";
+
 export default function FileList({ files, selectedId, onSelect }) {
   if (files.length === 0) return null;
 
@@ -9,30 +8,68 @@ export default function FileList({ files, selectedId, onSelect }) {
       {files.map((file) => (
         <li
           key={file.id}
-          className={file.id === selectedId ? "selected" : ""}
+          className={`file-item${file.id === selectedId ? " selected" : ""}`}
           onClick={() => onSelect(file.id)}
-          title={file.error ? file.error : file.name}
+          title={file.error ? `${file.name} — ${file.error}` : file.name}
         >
-          <StatusIcon status={file.status} />
-          <span className="name">{file.name}</span>
-          <span className="meta">
-            {file.error
-              ? "échec"
-              : file.status === "done"
-                ? `${file.result.pages.length} page${file.result.pages.length > 1 ? "s" : ""} · ${(file.result.confidence * 100).toFixed(0)}%`
-                : file.status === "processing"
-                  ? `${Math.round((file.progress || 0) * 100)}%`
-                  : "en attente"}
-          </span>
+          <span className="file-ext">{extOf(file.name)}</span>
+          <div className="file-info">
+            <span className="file-name">{file.name}</span>
+            {file.status === "processing" && (
+              <span className="file-progress">
+                <span style={{ width: `${Math.round((file.progress || 0) * 100)}%` }} />
+              </span>
+            )}
+          </div>
+          <span className="file-meta">{metaOf(file)}</span>
+          <StatusChip file={file} />
         </li>
       ))}
     </ul>
   );
 }
 
-function StatusIcon({ status }) {
-  if (status === "done") return <span className="status-ok">✓</span>;
-  if (status === "error") return <span className="status-error">✗</span>;
-  if (status === "processing") return <span className="spinner" />;
-  return <span className="status-wait">○</span>;
+function extOf(name) {
+  const dot = name.lastIndexOf(".");
+  const ext = dot !== -1 ? name.slice(dot + 1).toUpperCase() : "FILE";
+  return ext.slice(0, 4);
+}
+
+function metaOf(file) {
+  if (file.status === "done") {
+    const count = file.result.pages.length;
+    return `${count} page${count > 1 ? "s" : ""}`;
+  }
+  if (file.status === "processing") {
+    return `${Math.round((file.progress || 0) * 100)}%`;
+  }
+  return "";
+}
+
+function StatusChip({ file }) {
+  if (file.status === "done") {
+    return (
+      <span className="chip chip-ok">
+        <CheckIcon size={12} />
+        {(file.result.confidence * 100).toFixed(0)}%
+      </span>
+    );
+  }
+  if (file.status === "error") {
+    return (
+      <span className="chip chip-err">
+        <XIcon size={12} />
+        Échec
+      </span>
+    );
+  }
+  if (file.status === "processing") {
+    return (
+      <span className="chip chip-run">
+        <span className="spinner" />
+        {Math.round((file.progress || 0) * 100)}%
+      </span>
+    );
+  }
+  return <span className="chip chip-wait">En attente</span>;
 }

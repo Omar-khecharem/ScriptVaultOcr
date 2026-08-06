@@ -5,6 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
+from scriptvault import __version__ as scriptvault_version
 from scriptvault import core_ocr
 from scriptvault.core_ocr import (
     ImagePreprocessor,
@@ -33,7 +34,7 @@ def _text_like_image(angle_deg: float = 0.0) -> np.ndarray:
 # Versions & hiérarchie d'exceptions
 # --------------------------------------------------------------------------- #
 def test_version():
-    assert core_ocr.__version__ == "1.0.0"
+    assert core_ocr.__version__ == scriptvault_version
 
 
 def test_exception_hierarchy():

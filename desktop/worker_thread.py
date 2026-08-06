@@ -378,13 +378,15 @@ class BatchWorker(QThread):
         self._set_state("running")
         try:
             while not self._token.is_cancelled:
-                with self._stats.lock:
-                    drained = self._queue.empty() and self._stats.pending == 0
-                if drained:
-                    break
+                if self._is_drained():
+                    # Période de grâce: un submit() concurrent (ex. lancé juste
+                    # après start()) peut encore remplir la file. On vérifie
+                    # deux fois avant de conclure que le lot est terminé.
+                    time.sleep(0.05)
+                    if self._is_drained() and not self._token.is_cancelled:
+                        break
                 batch = self._drain_batch()
                 if not batch:
-                    time.sleep(0.02)
                     continue
                 for path, index in batch:
                     if self._token.is_cancelled:
@@ -405,6 +407,11 @@ class BatchWorker(QThread):
             self.batch_finished.emit(final)
             if self._gc_after_each:
                 gc.collect()
+
+    def _is_drained(self) -> bool:
+        """Vrai si la file est vide et aucun élément n'est en attente."""
+        with self._stats.lock:
+            return self._queue.empty() and self._stats.pending == 0
 
     def _drain_batch(self) -> list[tuple[PathLike, int]]:
         """Prélève jusqu'à ``batch_size`` éléments dans la file."""

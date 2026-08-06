@@ -14,6 +14,12 @@ import argparse
 import os
 import sys
 
+# Rend le package `scriptvault` importable quel que soit le répertoire d'appel
+# (racine du dépôt ou backend/), sans dépendre d'une installation -e.
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(

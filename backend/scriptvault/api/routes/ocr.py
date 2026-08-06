@@ -168,7 +168,7 @@ async def _process_file(
             for index, image in enumerate(images, start=1)
         ]
     else:
-        image = await asyncio.to_thread(preprocessor.read_image_bytes, data)
+        images = await asyncio.to_thread(preprocessor.read_pages_bytes, data)
         pages = [
             await _predict_page(
                 engines,
@@ -176,10 +176,11 @@ async def _process_file(
                 image,
                 lang,
                 use_preprocess,
-                1,
+                index,
                 started,
                 with_preview,
             )
+            for index, image in enumerate(images, start=1)
         ]
 
     total_ms = round((time.perf_counter() - started) * 1000.0, 2)
