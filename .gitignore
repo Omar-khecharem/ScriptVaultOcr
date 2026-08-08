@@ -71,6 +71,9 @@ _dbg*
 # --- PDF/OCR intermediates ---------------------------------------------------
 *.png.tmp
 
+# --- Runtime data (jobs/uploads persistés par l'API) --------------------------
+backend/STORAGE/
+
 # --- OS / IDE --------------------------------------------------------------
 Thumbs.db
 Desktop.ini

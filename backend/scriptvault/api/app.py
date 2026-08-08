@@ -17,12 +17,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .. import __version__
+from ..batch_engine import BatchManager
 from ..config import Settings
 from ..core_ocr import ImagePreprocessor, OCRBaseError, OCRInitError
 from ..engines import EngineFactory, EngineManager
 from ..exporter import ExportError
 from ..pdf import PDFRasterError
+from .routes import batches as batches_router
 from .routes import export as export_router
+from .routes import form as form_router
 from .routes import health as health_router
 from .routes import ocr as ocr_router
 
@@ -63,6 +66,8 @@ def create_app(
         app.state.preprocessor = ImagePreprocessor()
         app.state.engines = EngineManager(settings, engine_factory=engine_factory)
         await app.state.engines.start()
+        app.state.batch = BatchManager(settings, preprocessor=app.state.preprocessor)
+        await app.state.batch.init(app.state.engines)
         logger.info(
             "API démarrée — langue=%r, threads=%d, concurrency=%d.",
             settings.lang,
@@ -70,6 +75,7 @@ def create_app(
             settings.max_concurrency,
         )
         yield
+        await app.state.batch.close()
         await app.state.engines.close()
 
     app = FastAPI(
@@ -92,6 +98,8 @@ def create_app(
 
     app.include_router(health_router.router)
     app.include_router(ocr_router.router)
+    app.include_router(batches_router.router)
+    app.include_router(form_router.router)
     app.include_router(export_router.router)
 
     # --- Handlers d'erreurs globaux -------------------------------------

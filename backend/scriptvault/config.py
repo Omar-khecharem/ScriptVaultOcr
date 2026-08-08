@@ -161,7 +161,7 @@ class Settings:
             preprocess=_env_bool("SCRIPTVAULT_PREPROCESS", True),
             workers=max(0, _env_int("SCRIPTVAULT_WORKERS", 0)),
             use_processes=_env_bool("SCRIPTVAULT_USE_PROCESSES", True),
-            max_side_len=max(0, _env_int("SCRIPTVAULT_MAX_SIDE", 0)),
+            max_side_len=max(0, _env_int("SCRIPTVAULT_MAX_SIDE", 1600)),
             barcode_enabled=_env_bool("SCRIPTVAULT_BARCODE", True),
             barcode_budget_ms=max(1, _env_int("SCRIPTVAULT_BARCODE_BUDGET_MS", 15)),
             roi_enabled=_env_bool("SCRIPTVAULT_ROI_ENABLED", False),

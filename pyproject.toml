@@ -1,5 +1,5 @@
 [tool.pytest.ini_options]
-testpaths = ["backend/tests", "desktop/tests"]
+testpaths = ["backend/tests"]
 addopts = "-q"
 
 [tool.ruff]

@@ -21,6 +21,7 @@ __all__ = [
     "pdf",
     "exporter",
     "schemas",
+    "form_analyzer",
     "api",
     "__version__",
 ]

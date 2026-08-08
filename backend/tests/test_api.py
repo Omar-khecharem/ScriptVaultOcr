@@ -262,6 +262,104 @@ def test_export_filename_sanitized(client: TestClient):
 
 
 # --------------------------------------------------------------------------- #
+# Analyse de formulaire (post-traitement)
+# --------------------------------------------------------------------------- #
+def test_form_analyze_valid_document(client: TestClient):
+    """Items OCR réels -> formulaire structuré, champs validés."""
+    response = client.post(
+        "/api/form/analyze",
+        json={
+            "file_name": "scan.png",
+            "items": [
+                {
+                    "text": "Nom :",
+                    "confidence": 0.98,
+                    "box": [[50, 100], [260, 100], [260, 134], [50, 134]],
+                },
+                {
+                    "text": "Didi",
+                    "confidence": 0.96,
+                    "box": [[280, 100], [520, 100], [520, 134], [280, 134]],
+                },
+                {
+                    "text": "N° CIN :",
+                    "confidence": 0.97,
+                    "box": [[50, 160], [260, 160], [260, 194], [50, 194]],
+                },
+                {
+                    "text": "09728320",
+                    "confidence": 0.95,
+                    "box": [[280, 160], [520, 160], [520, 194], [280, 194]],
+                },
+            ],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["file_name"] == "scan.png"
+    assert data["is_form"] is True
+    assert data["processing_time_ms"] < 30.0
+    fields = {field["key"]: field for field in data["fields"]}
+    assert fields["nom"]["value"] == "Didi"
+    assert fields["nom"]["status"] == "valid"
+    assert fields["cin"]["status"] == "valid"
+
+
+def test_form_analyze_flags_errors(client: TestClient):
+    """CIN illisible (lettres non-corrigeables) + incohérence Série/Identifiant."""
+    rows = [
+        ("N° CIN :", "K97283ZK"),
+        ("Série :", "514"),
+        ("Identifiant :", "615001"),
+    ]
+    items = []
+    for row, (label, value) in enumerate(rows):
+        y0 = 100 + row * 60
+        items.append(
+            {
+                "text": label,
+                "confidence": 0.98,
+                "box": [[50, y0], [260, y0], [260, y0 + 34], [50, y0 + 34]],
+            }
+        )
+        items.append(
+            {
+                "text": value,
+                "confidence": 0.90,
+                "box": [[280, y0], [520, y0], [520, y0 + 34], [280, y0 + 34]],
+            }
+        )
+    response = client.post(
+        "/api/form/analyze", json={"file_name": "scan.png", "items": items}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    fields = {field["key"]: field for field in data["fields"]}
+    assert fields["cin"]["status"] == "error"
+    assert "lettres" in (fields["cin"]["error_message"] or "")
+    assert fields["identifiant"]["status"] == "error"
+    assert fields["serie"]["status"] == "error"
+
+
+def test_form_analyze_rejects_empty_items(client: TestClient):
+    response = client.post(
+        "/api/form/analyze", json={"file_name": "x.png", "items": []}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["is_form"] is False
+    assert data["fields"] == []
+
+
+def test_form_analyze_rejects_invalid_payload(client: TestClient):
+    response = client.post(
+        "/api/form/analyze",
+        json={"file_name": "x.png", "items": [{"text": 123, "confidence": "oops"}]},
+    )
+    assert response.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
 # Timeout d'inférence
 # --------------------------------------------------------------------------- #
 def test_ocr_timeout_maps_to_504(tmp_path: Path):

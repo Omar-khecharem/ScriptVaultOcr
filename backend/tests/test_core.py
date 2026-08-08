@@ -52,6 +52,25 @@ def test_preprocess_output_is_bgr8():
     assert out.dtype == np.uint8
 
 
+def test_resize_applies_max_side_limit():
+    """Le redimensionnement OCR est réellement appliqué (gain de vitesse majeur)."""
+    big = np.full((2400, 1200, 3), 255, dtype=np.uint8)
+    for y in range(200, 2400, 150):
+        cv2.rectangle(big, (60, y), (1100, y + 26), (0, 0, 0), -1)
+    out = ImagePreprocessor(max_side_len=1024).preprocess(big)
+    assert max(out.shape[:2]) <= 1024
+    assert out.shape[1] / out.shape[0] == pytest.approx(0.5, abs=0.01)
+    assert out.dtype == np.uint8
+
+
+def test_resize_skips_small_images():
+    """Une image déjà plus petite que la limite n'est jamais agrandie."""
+    img = _text_like_image()
+    small = img[::2, ::2]
+    out = ImagePreprocessor(max_side_len=1024).preprocess(small)
+    assert out.shape[:2] == small.shape[:2]
+
+
 def test_deskew_detects_rotation():
     applied = 7.0
     img = _text_like_image(angle_deg=applied)

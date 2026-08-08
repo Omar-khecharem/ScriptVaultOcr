@@ -85,7 +85,7 @@ _TIFF_MAGIC: tuple[bytes, bytes] = (b"II", b"MM")
 
 # Budget temps par défaut du scanner code-barres (ms) — spéc. < 15 ms.
 _DEFAULT_BARCODE_BUDGET_MS = 15.0
-_DEFAULT_MAX_SIDE = 1024
+_DEFAULT_MAX_SIDE = 1600
 _BARCODE_PREVIEW_SIDE = 1000
 
 
@@ -160,7 +160,7 @@ def _as_preprocessor_error(fn: F) -> F:
 def default_max_side_len() -> int:
     """Longueur maximale de côté pour le réseau OCR (variable d'environnement).
 
-    Lit ``SCRIPTVAULT_MAX_SIDE`` (défaut 1024). Les images plus grandes sont
+    Lit ``SCRIPTVAULT_MAX_SIDE`` (défaut 1600). Les images plus grandes sont
     réduites (ratio conservé) par interpolation AREA avant le réseau : gain de
     vitesse majeur sur les scans haute résolution, sans perte perceptible.
     """
@@ -516,7 +516,7 @@ class ImagePreprocessor:
         binarize: bool,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         image = self._as_bgr8(image)
-        image, scale = self.resize_for_ocr(image)
+        image, scale = self.resize_for_ocr(image, self._max_side_len or None)
         meta: dict[str, Any] = {
             "denoised": denoise,
             "clahe": clahe,
@@ -1189,7 +1189,9 @@ class LocalOCREngine:
             candidate["text_recognition_model_name"] = rec_name
             try:
                 engine = paddleocr_class(**candidate)
-                self.logger.info("Modèles CPU sélectionnés: %s / %s.", det_name, rec_name)
+                self.logger.info(
+                    "Modèles CPU sélectionnés: %s / %s.", det_name, rec_name
+                )
                 return engine
             except Exception as exc:
                 last_error = exc

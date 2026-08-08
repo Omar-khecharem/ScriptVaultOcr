@@ -1,5 +1,7 @@
 // ============================================================================
 // Client API — ScriptVault OCR backend (FastAPI)
+// Workflow entreprise : upload par lots, traitement en arrière-plan,
+// progression interrogée par polling, menus paginés côté client.
 // ============================================================================
 
 const API_BASE = "/api";
@@ -35,10 +37,24 @@ export function isSupportedFile(name) {
 async function parseError(response) {
   try {
     const payload = await response.json();
-    return payload.detail || payload.error || `Erreur ${response.status}`;
+    const detail = Array.isArray(payload.detail)
+      ? payload.detail.map((entry) => entry.msg).join(" · ")
+      : payload.detail;
+    return detail || payload.error || `Erreur ${response.status}`;
   } catch {
     return `Erreur ${response.status}`;
   }
+}
+
+function downloadBlob(blob, fallbackName) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fallbackName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 /** État du serveur et du pool de moteurs. */
@@ -48,26 +64,24 @@ export async function getHealth() {
   return response.json();
 }
 
-let currentRequestRef = null;
-
 /**
- * OCR d'un fichier avec progression d'upload (XHR).
+ * Dépose un lot de fichiers (multipart, progression d'upload via XHR).
  *
- * @param {File} file
- * @param {{lang: string, preprocess: boolean}} options
+ * @param {File[]} files
+ * @param {{name: string, lang: string, preprocess: boolean}} options
  * @param {(ratio: number) => void} onProgress
- * @returns {Promise<object>} réponse OCRResponse du backend
+ * @returns {Promise<{job: object, rejected?: Array}>}
  */
-export function ocrSingle(file, { lang, preprocess }, onProgress) {
+export function uploadBatch(files, { name, lang, preprocess }, onProgress) {
   return new Promise((resolve, reject) => {
     const form = new FormData();
-    form.append("file", file);
+    form.append("name", name);
     form.append("lang", lang);
     form.append("preprocess", String(preprocess));
-    form.append("preview", "true");
+    for (const file of files) form.append("files", file);
 
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", `${API_BASE}/ocr/single`);
+    xhr.open("POST", `${API_BASE}/batches`);
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable && onProgress) {
         onProgress(event.loaded / event.total);
@@ -89,16 +103,72 @@ export function ocrSingle(file, { lang, preprocess }, onProgress) {
     };
     xhr.onerror = () => reject(new Error("Impossible de joindre le serveur."));
     xhr.send(form);
-    currentRequestRef = xhr;
   });
 }
 
-/** Annule la requête OCR en cours (bouton Annuler). */
-export function abortOcr() {
-  if (currentRequestRef) {
-    currentRequestRef.abort();
-    currentRequestRef = null;
-  }
+/** Résumé d'un lot (progression, compteurs, confiance moyenne). */
+export async function getBatchJob(jobId) {
+  const response = await fetch(`${API_BASE}/batches/${jobId}`);
+  if (!response.ok) throw new Error(await parseError(response));
+  return response.json();
+}
+
+/**
+ * Liste des fichiers d'un lot — paginée et filtrable.
+ *
+ * @param {string} jobId
+ * @param {{page: number, pageSize: number, q: string}} params
+ */
+export async function listBatchFiles(jobId, { page, pageSize, q } = {}) {
+  const query = new URLSearchParams();
+  query.set("page", String(page || 1));
+  query.set("page_size", String(pageSize || 50));
+  if (q) query.set("q", q);
+  const response = await fetch(`${API_BASE}/batches/${jobId}/files?${query}`);
+  if (!response.ok) throw new Error(await parseError(response));
+  return response.json();
+}
+
+/** Détail complet d'un fichier : pages OCR + formulaire structuré. */
+export async function getBatchFile(jobId, fileId) {
+  const response = await fetch(`${API_BASE}/batches/${jobId}/files/${fileId}`);
+  if (!response.ok) throw new Error(await parseError(response));
+  return response.json();
+}
+
+/** Aperçu PNG (data URL) d'une page, telle qu'analysée. */
+export async function getBatchPreview(jobId, fileId, page) {
+  const response = await fetch(
+    `${API_BASE}/batches/${jobId}/files/${fileId}/preview?page=${page}`
+  );
+  if (!response.ok) throw new Error(await parseError(response));
+  return response.json();
+}
+
+/** Annule le traitement d'un lot en cours. */
+export async function cancelBatch(jobId) {
+  const response = await fetch(`${API_BASE}/batches/${jobId}/cancel`, {
+    method: "POST",
+  });
+  if (!response.ok) throw new Error(await parseError(response));
+  return response.json();
+}
+
+/** Supprime un lot (mémoire + zone de travail serveur). */
+export async function deleteBatch(jobId) {
+  const response = await fetch(`${API_BASE}/batches/${jobId}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) throw new Error(await parseError(response));
+  return response.json();
+}
+
+/** Export Excel de toutes les données du lot (téléchargement direct). */
+export async function exportBatchExcel(jobId) {
+  const response = await fetch(`${API_BASE}/batches/${jobId}/export.xlsx`);
+  if (!response.ok) throw new Error(await parseError(response));
+  const blob = await response.blob();
+  downloadBlob(blob, `scriptvault-lot-${jobId.slice(0, 8)}.xlsx`);
 }
 
 /**
@@ -113,14 +183,7 @@ export async function exportDocument(format, text, filename) {
   if (!response.ok) throw new Error(await parseError(response));
   const blob = await response.blob();
 
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
   const disposition = response.headers.get("Content-Disposition") || "";
   const match = /filename="([^"]+)"/.exec(disposition);
-  anchor.download = match ? match[1] : `scriptvault-export.${format}`;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  downloadBlob(blob, match ? match[1] : `scriptvault-export.${format}`);
 }

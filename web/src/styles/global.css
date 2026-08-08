@@ -468,6 +468,20 @@ select.input:focus-visible,
   min-height: 0;
 }
 
+.right-column {
+  flex: 2;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+
+.right-column .card-right {
+  flex: 1;
+  min-height: 0;
+}
+
 .card {
   display: flex;
   flex-direction: column;
@@ -487,6 +501,55 @@ select.input:focus-visible,
 .card-right {
   flex: 2;
   animation-delay: 0.06s;
+}
+
+/* ------------------------------------------------------------------
+   Mise en page 3 colonnes : documents | image | formulaire
+   ------------------------------------------------------------------ */
+.split-3 {
+  align-items: stretch;
+}
+
+.split-3 > .card-left {
+  flex: 2.1;
+  min-width: 280px;
+}
+
+.split-3 > .card-mid {
+  flex: 3.3;
+  min-width: 0;
+}
+
+.split-3 > .card-right {
+  flex: 2.6;
+  min-width: 300px;
+}
+
+.split-3 > .card-left .card-body {
+  overflow: hidden;
+}
+
+.file-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.split-3 .file-list {
+  max-height: none;
+}
+
+@media (max-width: 1080px) {
+  .split-3 {
+    flex-direction: column;
+  }
+
+  .split-3 > .card-left,
+  .split-3 > .card-mid,
+  .split-3 > .card-right {
+    flex: none;
+    min-height: 340px;
+  }
 }
 
 .card-head {
@@ -525,6 +588,7 @@ select.input:focus-visible,
   flex-direction: column;
   gap: 12px;
   padding: 14px 18px 16px;
+  position: relative;
 }
 
 .card-foot {
@@ -1184,6 +1248,366 @@ select.input:focus-visible,
     opacity: 1;
     transform: none;
   }
+}
+
+/* ------------------------------------------------------------------
+   Formulaire dynamique (post-traitement OCR)
+   ------------------------------------------------------------------ */
+.form-empty {
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  font-size: 13px;
+  padding: 48px 18px;
+}
+
+.form-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.form-badge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+
+.form-badge--error {
+  color: #fff;
+  background: #e74c3c;
+}
+
+.form-badge--warning {
+  color: #7f4f01;
+  background: #fdebd0;
+  border: 1px solid #f39c12;
+}
+
+.form-meta {
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.form-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.form-scroll {
+  overflow-y: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.form-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.form-section-title {
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-2);
+  margin: 0;
+  padding-bottom: 6px;
+  border-bottom: 2px solid var(--border);
+}
+
+.form-field {
+  display: grid;
+  grid-template-columns: minmax(120px, 34%) 1fr;
+  align-items: center;
+  column-gap: 12px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+}
+
+.form-field-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.form-field-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.form-field-dot--valid {
+  background: #2ecc71;
+}
+
+.form-field-dot--warning {
+  background: #f39c12;
+}
+
+.form-field-dot--error {
+  background: #e74c3c;
+}
+
+.form-field-dot--empty {
+  background: #9ca3af;
+}
+
+.form-field-input {
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Alerte rouge (spécification : border 2px solid red + fond #ffe6e6) */
+.form-field--error .form-field-input {
+  border: 2px solid #e74c3c;
+  background-color: #ffe6e6;
+  color: #78281f;
+  font-weight: 700;
+}
+
+.form-field--error {
+  border-color: color-mix(in srgb, #e74c3c 55%, transparent);
+  background: rgba(231, 76, 60, 0.06);
+}
+
+.form-field--warning .form-field-input {
+  border: 2px solid #f39c12;
+  background-color: #fdebd0;
+  color: #7f4f01;
+  font-weight: 600;
+}
+
+.form-field--valid .form-field-input {
+  border: 1px solid #2ecc71;
+}
+
+/* Champ du gabarit non lu par l'OCR (statut "empty") : neutre, pointillé */
+.form-field--empty {
+  border-style: dashed;
+  background: transparent;
+}
+
+.form-field--empty .form-field-input {
+  color: var(--text-3);
+  font-style: italic;
+  font-weight: 500;
+  border-color: var(--border);
+}
+
+.form-field-note {
+  grid-column: 2;
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.form-field-note[data-status="error"] {
+  color: #e74c3c;
+  font-weight: 600;
+}
+
+.form-field-note[data-status="warning"] {
+  color: #f39c12;
+}
+
+.form-field-note[data-status="empty"] {
+  color: var(--text-3);
+}
+
+/* ------------------------------------------------------------------
+   Onglets du panneau de droite (Texte / Formulaire)
+   ------------------------------------------------------------------ */
+.right-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 18px;
+  margin-top: 2px;
+}
+
+.right-tab {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.right-tab:hover {
+  color: var(--text);
+}
+
+.right-tab.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent-ring);
+}
+
+.right-tab .tab-alert {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 800;
+  color: #fff;
+  background: #e74c3c;
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+/* ------------------------------------------------------------------
+   Recherche de fichiers (liste du lot)
+   ------------------------------------------------------------------ */
+.file-search {
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  min-width: 0;
+  width: 220px;
+}
+
+.file-search:focus-visible {
+  outline: none;
+  border-color: var(--accent-ring);
+}
+
+.file-search:disabled {
+  opacity: 0.5;
+}
+
+/* ------------------------------------------------------------------
+   Pagination de la liste de fichiers
+   ------------------------------------------------------------------ */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 4px 10px 6px;
+}
+
+.pager-count {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  margin-right: 4px;
+}
+
+.pager-btn {
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  min-width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.pager-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent-ring);
+}
+
+.pager-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ------------------------------------------------------------------
+   Barre d'actions du lot
+   ------------------------------------------------------------------ */
+.batch-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 6px;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+}
+
+.batch-hint {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.btn-sm {
+  padding: 5px 10px;
+  font-size: 11.5px;
+}
+
+/* ------------------------------------------------------------------
+   Bannière d'envoi (upload de lot)
+   ------------------------------------------------------------------ */
+.upload-banner {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  bottom: 16px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--accent-ring);
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+.upload-banner .upload-label {
+  flex: none;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.upload-banner .progress {
+  flex: 1;
+  min-width: 120px;
 }
 
 @media (prefers-reduced-motion: reduce) {

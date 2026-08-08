@@ -1,10 +1,20 @@
 import { CheckIcon, XIcon } from "./icons.jsx";
 
+const STATUS_LABELS = {
+  pending: "En attente",
+  processing: "En traitement",
+  done: "Terminé",
+  error: "Erreur",
+  cancelled: "Annulé",
+};
+
+const FILE_EXT_PATTERN = /\.([a-z0-9]+)$/i;
+
 export default function FileList({ files, selectedId, onSelect }) {
   if (files.length === 0) return null;
 
   return (
-    <ul className="file-list" aria-label="Fichiers">
+    <ul className="file-list" aria-label="Fichiers du lot">
       {files.map((file) => (
         <li
           key={file.id}
@@ -17,7 +27,7 @@ export default function FileList({ files, selectedId, onSelect }) {
             <span className="file-name">{file.name}</span>
             {file.status === "processing" && (
               <span className="file-progress">
-                <span style={{ width: `${Math.round((file.progress || 0) * 100)}%` }} />
+                <span className="bar" />
               </span>
             )}
           </div>
@@ -29,19 +39,49 @@ export default function FileList({ files, selectedId, onSelect }) {
   );
 }
 
+export function FileListPager({ page, pageSize, total, onChange }) {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const from = total === 0 ? 0 : (page - 1) * pageSize + 1;
+  const to = Math.min(total, page * pageSize);
+  return (
+    <div className="pager">
+      <span className="pager-count">
+        {from}–{to} / {total}
+      </span>
+      <button
+        type="button"
+        className="pager-btn"
+        disabled={page <= 1}
+        onClick={() => onChange(page - 1)}
+        title="Page précédente"
+      >
+        ‹
+      </button>
+      <button
+        type="button"
+        className="pager-btn"
+        disabled={page >= totalPages}
+        onClick={() => onChange(page + 1)}
+        title="Page suivante"
+      >
+        ›
+      </button>
+    </div>
+  );
+}
+
 function extOf(name) {
-  const dot = name.lastIndexOf(".");
-  const ext = dot !== -1 ? name.slice(dot + 1).toUpperCase() : "FILE";
+  const match = FILE_EXT_PATTERN.exec(name || "");
+  const ext = match ? match[1].toUpperCase() : "FILE";
   return ext.slice(0, 4);
 }
 
 function metaOf(file) {
   if (file.status === "done") {
-    const count = file.result.pages.length;
-    return `${count} page${count > 1 ? "s" : ""}`;
+    return `${file.pages ?? 0} page${file.pages > 1 ? "s" : ""}`;
   }
-  if (file.status === "processing") {
-    return `${Math.round((file.progress || 0) * 100)}%`;
+  if (file.status === "error") {
+    return "en échec";
   }
   return "";
 }
@@ -51,7 +91,7 @@ function StatusChip({ file }) {
     return (
       <span className="chip chip-ok">
         <CheckIcon size={12} />
-        {(file.result.confidence * 100).toFixed(0)}%
+        {((file.confidence || 0) * 100).toFixed(0)}%
       </span>
     );
   }
@@ -67,9 +107,12 @@ function StatusChip({ file }) {
     return (
       <span className="chip chip-run">
         <span className="spinner" />
-        {Math.round((file.progress || 0) * 100)}%
+        OCR
       </span>
     );
   }
-  return <span className="chip chip-wait">En attente</span>;
+  if (file.status === "cancelled") {
+    return <span className="chip chip-wait">Annulé</span>;
+  }
+  return <span className="chip chip-wait">{STATUS_LABELS[file.status] || file.status}</span>;
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -70,6 +71,69 @@ class ExportRequest(BaseModel):
     format: Literal["txt", "docx", "pdf"]
     text: str = Field(default="", max_length=2_000_000)
     filename: Optional[str] = Field(default=None, max_length=255)
+
+
+class FormSection(str, Enum):
+    """Bloc du formulaire-type (gabarit feuille d'examen)."""
+
+    CONCOURS = "concours"
+    CANDIDAT = "candidat"
+    CODIFICATION = "codification"
+
+
+SECTION_LABELS: dict[FormSection, str] = {
+    FormSection.CONCOURS: "Concours & Session",
+    FormSection.CANDIDAT: "Informations du Candidat",
+    FormSection.CODIFICATION: "Codification & Traçabilité Administrative",
+}
+
+
+class FieldStatus(str, Enum):
+    """Statut de confiance d'un champ du formulaire dynamique.
+
+    * ``valid``   — confiance > 85 % et règles métier OK (vert) ;
+    * ``warning`` — confiance marginale 70–85 % mais format OK (orange) ;
+    * ``error``   — confiance < 70 % OU règle métier violée (rouge) ;
+    * ``empty``   — champ du gabarit non détecté par l'OCR (neutre).
+    """
+
+    VALID = "valid"
+    WARNING = "warning"
+    ERROR = "error"
+    EMPTY = "empty"
+
+
+class FormFieldResult(BaseModel):
+    """Un champ clé/valeur extrait du formulaire, avec son statut."""
+
+    key: str  # ex: "cin", "nom", "date_naissance"
+    label: str  # ex: "N° C.I.N ou N° du passeport"
+    value: str  # ex: "09728320"
+    confidence: float = Field(ge=0.0, le=1.0)  # ex: 0.94
+    status: FieldStatus  # error -> affiché en ROUGE par les clients
+    error_message: Optional[str] = (
+        None  # ex: "Format CIN invalide (8 chiffres attendus)"
+    )
+    bounding_box: Optional[list[list[int]]] = None
+    section: FormSection = FormSection.CANDIDAT
+    section_label: str = ""
+
+
+class FormAnalyzeRequest(BaseModel):
+    """Entrée du moteur de post-traitement : les items OCR bruts d'une page."""
+
+    file_name: str = Field(default="", max_length=255)
+    items: list[OCRItem] = Field(default_factory=list)
+
+
+class AnalyzedFormResponse(BaseModel):
+    """Formulaire structuré clé/valeur avec alertes de confiance."""
+
+    file_name: str
+    is_form: bool
+    global_confidence: float = Field(ge=0.0, le=1.0)
+    processing_time_ms: float = Field(ge=0.0)
+    fields: list[FormFieldResult] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):

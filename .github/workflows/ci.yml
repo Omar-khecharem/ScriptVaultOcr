@@ -1,6 +1,6 @@
 # ============================================================================
 # ScriptVault OCR — GitHub Actions CI
-# Monorepo : backend (Ruff/Mypy/Pytest) + desktop (Pytest/PySide6) + web (Vite)
+# Monorepo : backend (Ruff/Mypy/Pytest) + web (Vite)
 # ============================================================================
 name: CI
 
@@ -63,7 +63,6 @@ jobs:
         run: >
           mypy
           backend/scriptvault backend/main.py
-          desktop/gui_app.py desktop/worker_thread.py desktop/build_installer.py
 
   python-test:
     name: Python tests (${{ matrix.os }})
@@ -88,10 +87,10 @@ jobs:
           pip install --upgrade pip
           pip install -e ./backend --no-deps
           pip install pytest httpx fastapi "uvicorn[standard]" python-multipart \
-                      opencv-contrib-python numpy reportlab python-docx PyMuPDF PySide6
+                      opencv-contrib-python numpy reportlab python-docx PyMuPDF
 
       - name: Run tests
-        run: python -m pytest backend/tests desktop/tests -q
+        run: python -m pytest backend/tests -q
 
   web:
     name: Web (Vite build)
