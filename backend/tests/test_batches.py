@@ -209,6 +209,53 @@ def test_batch_export_excel(client: TestClient, tmp_path: Path):
     assert response.content.startswith(b"PK")
 
 
+def test_form_overrides_patch_and_excel(client: TestClient, tmp_path: Path):
+    """Les corrections manuelles du formulaire doivent persister et être
+    prises en compte dans l'export Excel."""
+    image = _sample_image(tmp_path)
+    job = _create_batch(client, [image])["job"]
+    _wait_done(client, job["id"])
+
+    items = client.get(f"/api/batches/{job['id']}/files").json()["items"]
+    file_id = items[0]["id"]
+
+    detail = client.get(f"/api/batches/{job['id']}/files/{file_id}").json()
+    assert detail["pages"], "le fichier doit avoir une page analysée"
+    assert detail["pages"][0]["form"] is not None
+
+    # Pas de correction au départ.
+    assert not detail.get("overrides")
+
+    # Correction du champ "nom" sur la page 1.
+    response = client.patch(
+        f"/api/batches/{job['id']}/files/{file_id}/form",
+        json={"page": 1, "values": {"nom": "DUPONT CORRIGE"}},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["overrides"]["nom"] == "DUPONT CORRIGE"
+
+    detail = client.get(f"/api/batches/{job['id']}/files/{file_id}").json()
+    assert detail["overrides"]["1"]["nom"] == "DUPONT CORRIGE"
+
+    # Une valeur vide efface la correction.
+    response = client.patch(
+        f"/api/batches/{job['id']}/files/{file_id}/form",
+        json={"page": 1, "values": {"nom": ""}},
+    )
+    assert response.status_code == 200
+    detail = client.get(f"/api/batches/{job['id']}/files/{file_id}").json()
+    assert "1" not in detail.get("overrides", {})
+
+    # Une seule page <= 1, page 99 introuvable.
+    assert (
+        client.patch(
+            f"/api/batches/{job['id']}/files/{file_id}/form",
+            json={"page": 99, "values": {"nom": "x"}},
+        ).status_code
+        == 404
+    )
+
+
 def test_cancel_and_delete_batch(client: TestClient, tmp_path: Path):
     image = _sample_image(tmp_path)
     job = _create_batch(client, [image])["job"]
@@ -271,6 +318,54 @@ def test_create_batch_isolates_invalid_files(client: TestClient, tmp_path: Path)
 def test_unknown_job_returns_404(client: TestClient):
     assert client.get("/api/batches/nope").status_code == 404
     assert client.get("/api/batches/nope/files").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Lecture par zones (profil SCRIPTVAULT_ROI)
+# --------------------------------------------------------------------------- #
+def test_batch_roi_profile_passes_rois_to_engine(tmp_path: Path):
+    """Avec ``roi_profile`` configuré, le lot transmet ``rois`` + le
+    ``scan_barcode=False`` au moteur (lecture par champs du formulaire)."""
+    captured: dict = {}
+
+    class RoiEngine:
+        cpu_threads = 4
+        is_ready = True
+
+        def predict_array(self, image, *, preprocess=True, rois=None, scan_barcode=None):
+            captured["rois"] = rois
+            captured["scan_barcode"] = scan_barcode
+            return [
+                {
+                    "label": label,
+                    "text": "VALEUR",
+                    "confidence": 0.8,
+                    "box": [[0, 0], [50, 0], [50, 10], [0, 10]],
+                }
+                for label in (rois or {})
+            ]
+
+        def close(self):
+            pass
+
+    settings = Settings(
+        preload=False,
+        max_concurrency=1,
+        timeout_ms=5000,
+        max_file_mb=5,
+        preprocess=True,
+        storage_root=str(tmp_path / "storage"),
+        roi_profile={"nom": (0.02, 0.09, 0.6, 0.14), "cin": (0.02, 0.24, 0.5, 0.29)},
+    )
+    app = create_app(settings=settings, engine_factory=lambda: RoiEngine())
+    image = _sample_image(tmp_path)
+    with TestClient(app) as client:
+        job = _create_batch(client, [image])["job"]
+        _wait_done(client, job["id"])
+        detail = client.get(f"/api/batches/{job['id']}/files")
+        assert detail.status_code == 200
+    assert captured["rois"] == settings.roi_profile
+    assert captured["scan_barcode"] is False
     assert client.post("/api/batches/nope/cancel").status_code == 404
     assert client.delete("/api/batches/nope").status_code == 404
     assert client.get("/api/batches/nope/export.xlsx").status_code == 404

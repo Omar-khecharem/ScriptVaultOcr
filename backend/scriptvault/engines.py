@@ -1,22 +1,16 @@
 """Gestion du cycle de vie des moteurs OCR côté serveur — scalable & Air-Gapped.
 
-Le moteur PaddleOCR n'est pas thread-safe : une instance ne sert qu'une
-requête à la fois. Deux modes d'exécution sont proposés :
-
-**Mode ``process`` (défaut)**
-    Un :class:`ProcessPoolExecutor` de ``settings.workers`` workers (0 = auto,
-    borné au nombre de cœurs ``os.cpu_count()``) est créé. Chaque worker porte
-    **son propre moteur OCR** (un modèle complet en RAM par worker). Le
-    Warm-start est effectué à l'initialisation : les poids des modèles sont
-    chargés en mémoire dès le démarrage du serveur, depuis le répertoire local
-    bundlé ``models/`` — fonctionnement 100 % hors-ligne, sans aucune
-    dépendance cloud.
+Les sessions ONNX (TrOCR HTR) sont thread-safe : le mode par défaut est donc
+un :class:`ProcessPoolExecutor` de ``settings.workers`` workers (0 = 1 seul,
+borné au nombre de cœurs). Chaque worker porte **son propre moteur OCR** ; le
+Warm-start est effectué à l'initialisation : les poids des modèles sont
+chargés en mémoire dès le démarrage du serveur, depuis le répertoire local
+``models/trocr/`` — fonctionnement 100 % hors-ligne, sans dépendance cloud.
 
 **Mode ``thread`` (repli)** : activé automatiquement si la fabrique de moteur
-    injectée n'est pas picklable (cas des tests), ou si
-    ``SCRIPTVAULT_USE_PROCESSES=false``. Un pool round-robin de slots, chaque
-    slot étant pinné sur un ``ThreadPoolExecutor(max_workers=1)`` (Paddle n'est
-    pas thread-safe).
+injectée n'est pas picklable (cas des tests), ou si
+``SCRIPTVAULT_USE_PROCESSES=false``. Un pool round-robin de slots, chaque
+slot étant pinné sur un ``ThreadPoolExecutor(max_workers=1)``.
 
 Les obstacles : parallélisme = nombre de workers ; les requêtes asynchrones
 sont mises en file et une limite de temps par inférence est appliquée
@@ -112,7 +106,33 @@ def _worker_call(method: str, arg: Any, kwargs: dict[str, Any]) -> Any:
 # Fabrique par défaut du moteur (module-level -> picklable, spawn-safe)
 # --------------------------------------------------------------------------- #
 def _default_engine_factory(settings: Settings) -> Any:
-    """Construit le moteur OCR serveur (100 % local, weights du dossier models/)."""
+    """Construit le moteur OCR serveur (100 % local, weights du dossier models/).
+
+    Le backend est choisi via ``settings.ocr_backend`` :
+
+    * ``"paddle"`` — PaddleOCR PP-OCRv5 (qualité imprimé/français) ;
+    * ``"htr"`` — TrOCR ONNX (repli sans Paddle) ;
+    * ``"auto"`` (défaut) — Paddle si ``paddleocr`` est installé, sinon HTR.
+    """
+    backend = (settings.ocr_backend or "auto").lower()
+    if backend in ("paddle", "auto"):
+        try:
+            from .paddle_engine import PaddleOCREngine
+
+            engine = PaddleOCREngine(
+                lang=settings.lang,
+                cpu_threads=settings.cpu_threads,
+                max_side_len=settings.max_side_len or None,
+                barcode=settings.barcode_enabled,
+                barcode_budget_ms=float(settings.barcode_budget_ms),
+            )
+            if not getattr(engine, "is_ready", False):
+                raise OCRInitError("PaddleOCR n'a pas pu initialiser ses modèles.")
+            return engine
+        except OCRInitError as exc:
+            if backend == "paddle":
+                raise
+            logger.warning("Paddle indisponible (%s) ; repli backend HTR.", exc)
     return LocalOCREngine(
         lang=settings.lang,
         model_dir=settings.model_dir,
@@ -121,7 +141,6 @@ def _default_engine_factory(settings: Settings) -> Any:
         max_side_len=settings.max_side_len or None,
         barcode=settings.barcode_enabled,
         barcode_budget_ms=float(settings.barcode_budget_ms),
-        enable_roi=settings.roi_enabled,
     )
 
 
@@ -346,11 +365,11 @@ class EngineManager:
         """
         lock = self._locks.setdefault(lang, asyncio.Lock())
         queue = self._queues.setdefault(
-            lang, asyncio.Queue(maxsize=self._settings.max_concurrency)
+            lang, asyncio.Queue(maxsize=self._settings.effective_max_concurrency)
         )
         async with lock:
             slots = self._slots.setdefault(lang, [])
-            if queue.empty() and len(slots) < self._settings.max_concurrency:
+            if queue.empty() and len(slots) < self._settings.effective_max_concurrency:
                 try:
                     engine = self._factory()
                 except Exception as exc:
@@ -451,10 +470,23 @@ class EngineManager:
         *,
         lang: Optional[str] = None,
         preprocess: Optional[bool] = None,
+        rois: Optional[ROIProfile] = None,
+        scan_barcode: Optional[bool] = None,
     ) -> list[OCRResultItem]:
-        """Reconnaît le texte d'une image numpy (page PDF rastérisée)."""
+        """Reconnaît le texte d'une image numpy (page PDF rastérisée).
+
+        ``rois`` : mode formulaires — chaque zone est transcrite séparément
+        (items portant ``label``), idéal pour la lecture de feuilles d'examen.
+        """
         lang = lang or self._settings.lang
-        return await self._predict(lang, "predict_array", image, preprocess=preprocess)
+        return await self._predict(
+            lang,
+            "predict_array",
+            image,
+            preprocess=preprocess,
+            rois=rois,
+            scan_barcode=scan_barcode,
+        )
 
     async def predict_pages_bytes(
         self,

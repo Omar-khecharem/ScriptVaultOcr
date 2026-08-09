@@ -1,31 +1,34 @@
-"""Moteur OCR local haute performance (PaddleOCR CPU + OpenCV), 100 % hors-ligne.
+"""Moteur HTR local haute performance (TrOCR ONNX + OpenCV), 100 % hors-ligne.
 
-Module autonome, sans aucune dépendance cloud ni API externe. Il expose:
+Module autonome, sans aucune dépendance cloud ni API externe. Il expose :
 
 * :class:`ImagePreprocessor` — lecture robuste multi-formats **y compris TIFF
-  mono/multi-pages** (Pillow), pipeline OpenCV "fast" : conversion grayscale,
-  binarisation d'Otsu optimisée, redressement automatique (deskew), et
-  redimensionnement intelligent pour le réseau OCR (``SCRIPTVAULT_MAX_SIDE``).
+  mono/multi-pages** (Pillow), pipeline OpenCV : conversion grayscale,
+  binarisation d'Otsu, redressement automatique (deskew) et redimensionnement
+  intelligent (``SCRIPTVAULT_MAX_SIDE``).
 * :class:`BarcodeScanner` — détection locale de codes-barres / QR codes via
-  ``cv2.barcode`` (repli ``pyzbar``), avec budget temps < 15 ms.
-* :class:`LocalOCREngine` — wrapper PaddleOCR optimisé CPU (MKL-DNN / OpenMP),
-  lecture hybride **code-barres + OCR**, découpage par zones d'intérêt (ROI)
-  avec reconnaissance seule ``det=False`` (réduction ~70 % du calcul sur les
-  formulaires structurés), sortie structurée ``[{"text", "confidence", "box"}]``.
+  ``cv2.barcode`` (repli ``cv2.QRCodeDetector``), avec budget temps < 15 ms.
+* :class:`LocalOCREngine` — transcription manuscrite par TrOCR-small
+  (ONNX Runtime quantifié int8) : détection de lignes OpenCV, reconnaissance
+  par zone d'intérêt (ROI), sortie structurée
+  ``[{"text", "confidence", "box"}]``.
+
+Le moteur est thread-safe : les sessions ONNX supportent les appels
+simultanés et sont chargées une seule fois au démarrage (``warm_up``).
 
 Exemple::
 
     from core_ocr import LocalOCREngine, DEFAULT_EXAM_ROIS
 
-    engine = LocalOCREngine(lang="en")
+    engine = LocalOCREngine()
     pages = engine.predict_pages("scan_2024.tif", rois=DEFAULT_EXAM_ROIS)
     for page in pages:
         print(page["page"], page["text"], page["barcodes"])
     engine.close()
 
-Dépendances: ``paddlepaddle``, ``paddleocr>=2.7``, ``opencv-contrib-python``
-(>= 4.8 pour ``cv2.barcode``), ``numpy``, ``Pillow`` (TIFF multipages).
-``pyzbar`` est un accélérateur optionnel si ``cv2.barcode`` est absent.
+Dépendances: ``onnxruntime``, ``opencv-contrib-python`` (>= 4.8 pour
+``cv2.barcode``), ``numpy``, ``Pillow`` (TIFF multipages). Les poids TrOCR
+quantifiés sont dans ``models/trocr/`` (``download_trocr_models.py``).
 """
 
 from __future__ import annotations
@@ -35,15 +38,24 @@ import io
 import logging
 import math
 import os
-import platform
-import sys
 import time
-import warnings
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional, TypedDict, TypeVar, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Literal,
+    Optional,
+    TypedDict,
+    TypeVar,
+    Union,
+)
 
 import cv2
 import numpy as np
+
+if TYPE_CHECKING:
+    from .htr_engine import TrOcrEngine
 
 __version__ = "2.0.0"
 __all__ = [
@@ -409,7 +421,7 @@ class ImagePreprocessor:
         """Découpage complet des pages TIFF via Pillow (tous codecs)."""
         try:
             from PIL import Image
-        except ImportError as exc:  # pragma: no cover - dépedance réelle
+        except ImportError as exc:  # pragma: no cover - dépendance réelle
             raise OCRImageError(
                 "Pillow est requis pour lire les fichiers TIFF (pip install Pillow)."
             ) from exc
@@ -552,16 +564,19 @@ class ImagePreprocessor:
     @staticmethod
     def _denoise(image: np.ndarray) -> np.ndarray:
         """Débruitage gaussien puis médian (bruit mixte gaussien / sel poivre)."""
-        smoothed = cv2.GaussianBlur(image, (3, 3), 0)
+        smoothed = cv2.GaussianBlur(image, (1, 1), 0)
         return cv2.medianBlur(smoothed, 3)
 
     def _apply_clahe(self, image: np.ndarray) -> np.ndarray:
         """Égalisation adaptative (CLAHE) sur le canal L de l'espace LAB."""
+        return self._apply_clahe_strength(image, clip=self._clahe_clip)
+
+    def _apply_clahe_strength(self, image: np.ndarray, *, clip: float) -> np.ndarray:
+        """CLAHE avec force configurable (``clip`` élevé = contraste local plus
+        marqué, adapté aux zones manuscrites pâles)."""
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l_channel, a_channel, b_channel = cv2.split(lab)
-        clahe = cv2.createCLAHE(
-            clipLimit=self._clahe_clip, tileGridSize=self._clahe_grid
-        )
+        clahe = cv2.createCLAHE(clipLimit=max(1.0, float(clip)), tileGridSize=(8, 8))
         l_channel = clahe.apply(l_channel)
         return cv2.cvtColor(
             cv2.merge((l_channel, a_channel, b_channel)), cv2.COLOR_LAB2BGR
@@ -584,16 +599,16 @@ class ImagePreprocessor:
 
     @staticmethod
     def _deskew_hough(gray: np.ndarray) -> float:
-        """Estime l'angle par Transformée de Hough probabiliste (degrés)."""
-        height, width = gray.shape
-        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-        min_length = max(60, int(min(width, height) * 0.25))
+        """Estimation par Hough probabiliste (lignes longues, angle dominant)."""
+        _, edges = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if float(np.mean(edges)) > 127.0:
+            edges = cv2.bitwise_not(edges)
         lines = cv2.HoughLinesP(
             edges,
-            1,
-            np.pi / 180.0,
-            threshold=80,
-            minLineLength=min_length,
+            rho=1,
+            theta=np.pi / 360.0,
+            threshold=180,
+            minLineLength=max(32, gray.shape[1] // 12),
             maxLineGap=15,
         )
         if lines is None or len(lines) == 0:
@@ -665,16 +680,25 @@ class ImagePreprocessor:
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         return self._normalize_polarity(thresh)
 
-    def _binarize_adaptive(self, image: np.ndarray) -> np.ndarray:
-        """Binarisation adaptative gaussienne (textes fins / fonds hétérogènes)."""
+    def _binarize_adaptive(
+        self, image: np.ndarray, *, block: Optional[int] = None, c: Optional[float] = None
+    ) -> np.ndarray:
+        """Binarisation adaptative gaussienne (textes fins / fonds hétérogènes).
+
+        ``block``/``c`` surchargent les valeurs configurées (utile pour les
+        zones manuscrites aux traits fins).
+        """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        block_size = block if block and block > 0 else self._adaptive_block
+        c_value = c if c is not None else self._adaptive_c
+        block_size = max(3, int(block_size) | 1)
         thresh = cv2.adaptiveThreshold(
             gray,
             255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
-            self._adaptive_block,
-            self._adaptive_c,
+            block_size,
+            float(c_value),
         )
         return self._normalize_polarity(thresh)
 
@@ -685,12 +709,86 @@ class ImagePreprocessor:
             gray = cv2.bitwise_not(gray)
         return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
+    # ------------------------------------------------------------------ #
+    # Zones manuscrites : pipeline adaptatif (CLAHE + ombres + adaptative)
+    # ------------------------------------------------------------------ #
+    @_as_preprocessor_error
+    def preprocess_handwritten(
+        self,
+        image: np.ndarray,
+        *,
+        shadow_suppress: bool = True,
+        contrast: bool = True,
+        binarize: bool = True,
+        structural: bool = False,
+    ) -> np.ndarray:
+        """Prétraite une **zone manuscrite** — écriture pauvre en contraste,
+        fonds tachés/ombragés des copies scannées.
+
+        Le pipeline, propre aux zones à la main, combine :
+
+        1. ``shadow_suppress`` — estimation du fond par un flou très collant
+           puis soustraction : la teinte continue du papier (ombre/taches)
+           disparaît, l'encre sombre est préservée ;
+        2. ``contrast`` — CLAHE renforcé (clipLimit 3.0) sur le canal L de
+           l'espace LAB ;
+        3. ``binarize`` — seuillage **adaptatif gaussien** par blocs
+           (19×19, C=8) résistant aux pâleurs de la plume, polarité
+           normalisée (texte sombre sur fond clair) ;
+        4. ``structural`` — renforcement des barres des lettres (ouverture/
+           fermeture verticale légère) pour aider la segmentation de
+           l'écriture cursive avant OCR.
+
+        Entrées : BGR ou gris (automatiquement normalisé). Sortie : BGR.
+        """
+        image = self._as_bgr8(image)
+        if shadow_suppress:
+            image = self._suppress_shadow(image)
+        if contrast:
+            image = self._apply_clahe_strength(image, clip=3.0)
+        if binarize:
+            image = self._binarize_adaptive(image, block=19, c=8.0)
+        if structural:
+            image = self._emphasize_strokes(image)
+        return self._final_contour(image)
+
+    @staticmethod
+    def _suppress_shadow(image: np.ndarray) -> np.ndarray:
+        """Retire le fond papier (ombres, taches, relief du scan).
+
+        Soustrait un flou très fort (sigma 25) : seule la variation locale
+        rapide (l'encre) ressort, la teinte continue du fond disparaît.
+        """
+        blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=25.0)
+        difference = cv2.subtract(blurred, image)
+        return cv2.add(difference, 128)
+
+    @staticmethod
+    def _emphasize_strokes(image: np.ndarray) -> np.ndarray:
+        """Renforce les barres de l'écriture (morphologie verticale) avant OCR.
+
+        Fermeture verticale (1×3) reliant les points de l'encre dans le sens
+        de l'écriture ; l'excès est borné pour ne pas coller les lettres.
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+        closed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+        merged = cv2.addWeighted(gray, 0.85, closed, 0.15, 0.0)
+        return cv2.cvtColor(merged, cv2.COLOR_GRAY2BGR)
+
+    @staticmethod
+    def _final_contour(image: np.ndarray) -> np.ndarray:
+        """Normalisation finale : BGR 8 bits, polarité texte-sombre."""
+        image = np.clip(image, 0, 255).astype(np.uint8)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
 
 # --------------------------------------------------------------------------- #
 # Zones d'intérêt (ROI) par défaut — formulaires type feuille d'examen
 # --------------------------------------------------------------------------- #
 # Coordonnées en fractions de page (x0, y0, x1, y1) — à adapter au gabarit réel
-# du formulaire grâce à la variable d'environnement ``SCRIPTVAULT_ROI``.
+# du formulaire (mode CLI ``--roi``).
 DEFAULT_EXAM_ROIS: ROIProfile = {
     "identifiant": (0.020, 0.020, 0.360, 0.065),
     "nom": (0.020, 0.090, 0.560, 0.140),
@@ -715,8 +813,6 @@ class BarcodeScanner:
       ``cv2.QRCodeDetector`` en repli si le budget (15 ms par défaut) le
       permet.
     * Les coordonnées retournées sont retraduites à l'échelle d'origine.
-
-    ``pyzbar`` est un repli optionnel si ``cv2.barcode`` est indisponible.
     """
 
     def __init__(
@@ -800,7 +896,7 @@ class BarcodeScanner:
 
             self._barcode_detector = barcode.BarcodeDetector()  # type: ignore[attr-defined]
         except Exception as exc:
-            self.logger.debug("cv2.barcode indisponible (%s); repli pyzbar/QR.", exc)
+            self.logger.debug("cv2.barcode indisponible (%s); repli QR.", exc)
             self._barcode_detector = False
         return self._barcode_detector if self._barcode_detector is not False else None
 
@@ -898,24 +994,25 @@ class BarcodeScanner:
 
 
 # --------------------------------------------------------------------------- #
-# Moteur OCR local
+# Moteur OCR local (HTR TrOCR — ONNX, quantifié int8)
 # --------------------------------------------------------------------------- #
+def _dark_ratio(image: np.ndarray) -> float:
+    """Proportion de pixels sombres (encre) : ``gray < 128`` dans [0, 1]."""
+    gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return float((gray < 128).mean())
+
+
 class LocalOCREngine:
-    """Moteur PaddleOCR local, optimisé CPU (MKL-DNN / OpenMP / AVX2).
+    """Moteur HTR local : TrOCR-small-handwritten en ONNX Runtime (CPU).
 
-    Caractéristiques:
+    Caractéristiques :
 
-    * Import paresseux de PaddlePaddle (le module ``core_ocr`` est importable
-      sans Paddle).
-    * Pré-chargement des poids en mémoire (dossier local ``model_dir/`` ou
-      cache ``~/.paddleocr``) et ``warm_up()`` matérialisant les modèles dans
-      la RAM dès l'initialisation (Warm-start, 100 % hors-ligne).
-    * Multi-threading CPU: ``OMP_NUM_THREADS`` / ``MKL_NUM_THREADS`` et
-      ``paddle.set_num_threads``.
-    * Compatible PaddleOCR 2.x et 3.x (détection automatique de l'API).
-    * **Lecture hybride** : détection de codes-barres / QR locaux (< 15 ms),
-      puis passe OCR globale ou par zones d'intérêt (ROI) avec reconnaissance
-      seule (``det=False``.
+    * Sessions ONNX **quantifiées int8** (encodeur + décodeur fusionnés),
+      chargées une seule fois au démarrage (``warm_up``) — thread-safe.
+    * Détection de lignes manuscrites par projection OpenCV (sans réseau).
+    * Zones d'intérêt (ROI) : transcription d'une passe par zone ; les zones
+      vides (aucune encre) sont ignorées — aucun coût de calcul inutile.
+    * Sortie normalisée ``[{"text", "confidence", "box"}]``.
     """
 
     def __init__(
@@ -923,65 +1020,41 @@ class LocalOCREngine:
         lang: str = "en",
         model_dir: Optional[PathLike] = None,
         cpu_threads: int = 0,
-        use_mp: Optional[bool] = None,
-        total_process_num: int = 0,
-        use_angle_cls: bool = False,
-        use_mkldnn: bool = False,
-        det_model_dir: Optional[PathLike] = None,
-        rec_model_dir: Optional[PathLike] = None,
-        cls_model_dir: Optional[PathLike] = None,
         preprocess_kwargs: Optional[dict[str, Any]] = None,
         preprocessor: Optional[ImagePreprocessor] = None,
         logger: Optional[logging.Logger] = None,
         *,
-        det_model_name: Optional[str] = None,
-        rec_model_name: Optional[str] = None,
         max_side_len: Optional[int] = None,
         barcode: bool = True,
         barcode_budget_ms: float = _DEFAULT_BARCODE_BUDGET_MS,
         barcode_max_preview_side: int = _BARCODE_PREVIEW_SIDE,
-        enable_roi: bool = False,
+        min_ink_ratio: float = 0.0015,
     ) -> None:
-        """Initialise le moteur.
+        """Initialise le moteur HTR.
 
         Args:
-            lang: Langue des modèles de reconnaissance (``"en"``, ``"fr"``,
-                ``"ch"``, ...).
-            model_dir: Dossier racine ``det/``, ``rec/``, ``cls/`` pour un
-                chargement 100 % local des poids (bundle Air-Gapped). Si omis,
-                PaddleOCR utilise son cache.
-            cpu_threads: Threads CPU (OpenMP/MKL). ``0`` = défaut
-                (min(8, cœurs)).
-            use_mp / total_process_num: Multi-processus PaddleOCR 2.x
-                (désactivé par défaut sur Windows : mode ``spawn`` non géré
-                ici, voir :mod:`engines`).
-            use_angle_cls: Classification d'orientation des lignes. Coûteuse
-                (un modèle par ligne) : désactivée par défaut.
-            use_mkldnn: Accélération MKL-DNN. Désactivé par défaut
-                (paddlepaddle 3.3.1 + oneDNN/PP-OCRv6 incompatible).
-            det_model_dir / rec_model_dir / cls_model_dir: Chemins explicites
-                des modèles (surpassent ``model_dir``).
-            det_model_name / rec_model_name: Noms des modèles PaddleOCR 3.x
-                (ex. ``PP-OCRv5_mobile_det``). Si omis sans ``model_dir``, le
-                moteur choisit des modèles mobiles rapides sur CPU.
-            preprocess_kwargs: Arguments d'appel de
-                :meth:`ImagePreprocessor.preprocess` par prédiction.
+            lang: Langue (informatif — TrOCR est bilingue/zéro-shot).
+            model_dir: Dossier des poids TrOCR (``encoder_model_quantized.onnx``
+                + ``decoder_model_merged_quantized.onnx`` + ``tokenizer.json``).
+                Si omis : ``<racine du projet>/models/trocr``.
+            cpu_threads: Threads CPU ONNX. ``0`` = moins(8, cœurs).
+            preprocess_kwargs: Options de :meth:`ImagePreprocessor.preprocess`.
             preprocessor: Instance à réutiliser (injection tests).
             logger: Logger.
-            max_side_len: Longueur max côté réseau OCR. ``None`` →
-                ``SCRIPTVAULT_MAX_SIDE``.
-            barcode: Active le scanner code-barres / QR local.
-            barcode_budget_ms: Budget de détection code-barres (ms).
+            max_side_len: Longueur max côté après prétraitement.
+            barcode: Active le scanner local de codes-barres.
+            barcode_budget_ms: Budget du scan code-barres par page (ms).
             barcode_max_preview_side: Taille de la vue de détection.
-            enable_roi: Préchauffe également le prédicteur de reconnaissance
-                seul (``det=False``) pour le mode ROI.
+            min_ink_ratio: Ratio minimal d'encre (dans [0,1]) sous lequel une
+                zone est considérée vide — évite les inférences inutiles et le
+                bruit (règles imprimées, ombres).
 
         Raises:
-            OCRInitError: Paddle/paddleocr manquants ou échec de chargement.
+            OCRInitError: modèles TrOCR ONNX absents (voir
+                ``scriptvault.download_trocr_models``).
         """
         self.logger = logger or logging.getLogger("scriptvault.core_ocr.engine")
         self.lang = lang
-        self.use_angle_cls = bool(use_angle_cls)
         self._preprocessor = preprocessor or ImagePreprocessor(
             logger=self.logger, max_side_len=max_side_len
         )
@@ -989,9 +1062,8 @@ class LocalOCREngine:
         self._max_side_len = (
             max_side_len if max_side_len is not None and max_side_len > 0 else None
         )
-        self._ocr: Any = None
-        self._api_v3: bool = False
-        self._ready: bool = False
+        self._min_ink_ratio = max(0.0, float(min_ink_ratio))
+        self._ready = False
 
         self._scan_barcode = bool(barcode)
         self._barcode_scanner = (
@@ -1003,268 +1075,117 @@ class LocalOCREngine:
             if self._scan_barcode
             else None
         )
-        self._enable_roi = bool(enable_roi)
-        self._rec_predictor: Any = None  # None = non construit, False = échec
-        self._rec_model_dir: Optional[str] = None
-        self._det_model_name = det_model_name
-        self._rec_model_name = rec_model_name
 
         cpu_count = os.cpu_count() or 4
         self.cpu_threads = cpu_threads if cpu_threads > 0 else min(8, cpu_count)
-        self._total_process_num = (
-            total_process_num if total_process_num > 0 else min(4, cpu_count)
-        )
-        if use_mp is None:
-            use_mp = platform.system() != "Windows"
-            self.logger.info(
-                "Multi-processus auto: %s (désactivé sur Windows, mode spawn).",
-                use_mp,
-            )
-        self.use_mp = bool(use_mp) and self._total_process_num > 1
 
-        self._setup_cpu_environment()
-        self._ocr = self._build_paddleocr(
-            lang=lang,
-            model_dir=model_dir,
-            use_angle_cls=use_angle_cls,
-            use_mkldnn=use_mkldnn,
-            det_model_dir=det_model_dir,
-            rec_model_dir=rec_model_dir,
-            cls_model_dir=cls_model_dir,
-        )
+        from .htr_engine import HandwrittenLineDetector, TrOcrEngine
+
+        htr_dir = self._resolve_model_dir(model_dir)
+        self._htr: TrOcrEngine | None = TrOcrEngine(htr_dir, threads=self.cpu_threads)
+        self._detector = HandwrittenLineDetector(max_lines=32)
+        self._backend_name = "htr"
+        self.logger.info("Backend HTR (TrOCR ONNX) initialisé : %s.", htr_dir)
         self.warm_up()
 
-    # ------------------------------------------------------------------ #
-    # Initialisation
-    # ------------------------------------------------------------------ #
     @staticmethod
-    def _setup_cpu_environment() -> None:
-        """Configure l'environnement CPU avant l'import Paddle."""
-        if "paddle" in sys.modules:
-            warnings.warn(
-                "PaddlePaddle déjà importé : OMP/MKL_NUM_THREADS non appliqués.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        threads = str(min(8, os.cpu_count() or 4))
-        os.environ.setdefault("OMP_NUM_THREADS", threads)
-        os.environ.setdefault("MKL_NUM_THREADS", threads)
-        # FLAGS_use_mkldnn non défini (paddlepaddle 3.3.1 + oneDNN casse
-        # l'inférence PP-OCRv6 : ConvertPirAttribute2RuntimeAttribute).
-        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    def _resolve_model_dir(model_dir: Optional[PathLike]) -> Path:
+        """Localise le dossier des modèles TrOCR.
 
-    def _build_paddleocr(
-        self,
-        *,
-        lang: str,
-        model_dir: Optional[PathLike],
-        use_angle_cls: bool,
-        use_mkldnn: bool,
-        det_model_dir: Optional[PathLike],
-        rec_model_dir: Optional[PathLike],
-        cls_model_dir: Optional[PathLike],
-    ) -> Any:
-        try:
-            import paddle
-            import paddleocr
-            from paddleocr import PaddleOCR
-        except ImportError as exc:
-            raise OCRInitError(
-                "Dépendances OCR manquantes (pip install paddlepaddle paddleocr)."
-            ) from exc
-
-        try:
-            paddle.set_num_threads(self.cpu_threads)
-        except Exception as exc:  # pragma: no cover - version dépendante
-            self.logger.warning("paddle.set_num_threads indisponible: %s", exc)
-        if hasattr(paddle, "is_compiled_with_mkldnn"):
-            self.logger.info(
-                "PaddlePaddle compilé avec MKL-DNN: %s",
-                paddle.is_compiled_with_mkldnn(),
-            )
-
-        version = str(getattr(paddleocr, "__version__", "2.7"))
-        try:
-            major = int(version.split(".")[0])
-        except ValueError:
-            major = 2
-        self._api_v3 = major >= 3
-        self.logger.info(
-            "API paddleocr détectée: %s (v%s)",
-            "3.x" if self._api_v3 else "2.x",
-            version,
-        )
-
+        Cherche successivement ``model_dir`` lui-même, ``model_dir/trocr``,
+        puis la racine du projet ``models/trocr`` (sortie du script de
+        téléchargement).
+        """
+        candidates: list[Path] = []
         if model_dir is not None:
             root = Path(model_dir)
-            det_model_dir = det_model_dir or str(root / "det")
-            rec_model_dir = rec_model_dir or str(root / "rec")
-            cls_model_dir = cls_model_dir or str(root / "cls")
-        if rec_model_dir is not None:
-            self._rec_model_dir = os.fspath(rec_model_dir)
-
-        kwargs: dict[str, Any] = {
-            "lang": lang,
-            "enable_mkldnn": use_mkldnn,
-            "cpu_threads": self.cpu_threads,
-        }
-        if self._api_v3:
-            kwargs["device"] = "cpu"
-        else:
-            kwargs.update(
-                {
-                    "use_gpu": False,
-                    "use_mp": self.use_mp,
-                    "total_process_num": self._total_process_num,
-                }
-            )
-        if det_model_dir is not None:
-            key = "text_detection_model_dir" if self._api_v3 else "det_model_dir"
-            kwargs[key] = os.fspath(det_model_dir)
-        if rec_model_dir is not None:
-            key = "text_recognition_model_dir" if self._api_v3 else "rec_model_dir"
-            kwargs[key] = os.fspath(rec_model_dir)
-        if cls_model_dir is not None:
-            key = (
-                "textline_orientation_model_dir"
-                if self._api_v3
-                else "angle_cls_model_dir"
-            )
-            kwargs[key] = os.fspath(cls_model_dir)
-
-        if self._api_v3:
-            kwargs.update(
-                {
-                    "use_doc_orientation_classify": False,
-                    "use_doc_unwarping": False,
-                    "use_textline_orientation": use_angle_cls,
-                }
-            )
-            # Sans modèles locaux explicites, choisir des modèles mobiles
-            # (CPU) : les "medium" par défaut sont ~10x plus lents.
-            if det_model_dir is None and rec_model_dir is None:
-                return self._build_v3_with_cpu_models(PaddleOCR, kwargs)
-        else:
-            kwargs.update({"use_angle_cls": use_angle_cls, "show_log": False})
-
-        try:
-            engine = PaddleOCR(**kwargs)
-        except Exception as exc:
-            raise OCRInitError(
-                f"Échec de l'initialisation PaddleOCR (lang={lang!r}): {exc}"
-            ) from exc
-        return engine
-
-    @staticmethod
-    def _v3_cpu_model_candidates(
-        det_name: Optional[str], rec_name: Optional[str]
-    ) -> list[tuple[str, str]]:
-        """Paires ``(det, rec)`` testées dans l'ordre (modèles mobiles CPU).
-
-        Les modèles ``medium`` par défaut de PaddleOCR 3.x sont beaucoup trop
-        lents en inférence CPU sans MKL-DNN. Les modèles mobiles sont 5-10x
-        plus rapides pour une précision très proche. Si un nom explicite est
-        fourni, seule cette paire est tentée.
-        """
-        if det_name or rec_name:
-            return [
-                (det_name or "PP-OCRv5_mobile_det", rec_name or "PP-OCRv5_mobile_rec")
-            ]
-        return [
-            ("PP-OCRv5_mobile_det", "PP-OCRv5_mobile_rec"),
-            ("PP-OCRv4_mobile_det", "PP-OCRv4_mobile_rec"),
-            ("PP-OCRv3_mobile_det", "PP-OCRv3_mobile_rec"),
-        ]
-
-    def _build_v3_with_cpu_models(
-        self, paddleocr_class: Any, kwargs: dict[str, Any]
-    ) -> Any:
-        """Construit le prédicteur avec des modèles mobiles (repli en chaîne)."""
-        last_error: Optional[BaseException] = None
-        for det_name, rec_name in self._v3_cpu_model_candidates(
-            self._det_model_name, self._rec_model_name
-        ):
-            candidate = dict(kwargs)
-            candidate["text_detection_model_name"] = det_name
-            candidate["text_recognition_model_name"] = rec_name
-            try:
-                engine = paddleocr_class(**candidate)
-                self.logger.info(
-                    "Modèles CPU sélectionnés: %s / %s.", det_name, rec_name
-                )
-                return engine
-            except Exception as exc:
-                last_error = exc
-                self.logger.warning(
-                    "Modèles %s / %s indisponibles (%s) ; repli.",
-                    det_name,
-                    rec_name,
-                    exc,
-                )
+            candidates = [root / "trocr", root]
+        candidates.append(Path(__file__).resolve().parents[2] / "models" / "trocr")
+        for candidate in candidates:
+            if (
+                candidate / "encoder_model_quantized.onnx"
+            ).exists():
+                return candidate
         raise OCRInitError(
-            "Aucun modèle OCR mobile n'a pu être chargé "
-            f"(dernière erreur: {last_error})"
-        ) from last_error
+            "Moteur HTR : modèles TrOCR ONNX absents. "
+            "Lancez : python -m scriptvault.download_trocr_models"
+        )
 
     # ------------------------------------------------------------------ #
     # API publique
     # ------------------------------------------------------------------ #
     @property
     def is_ready(self) -> bool:
-        """Indique si le moteur est initialisé et les modèles chargés."""
-        return self._ready and self._ocr is not None
+        """Indique si le moteur est initialisé (modèles chargés)."""
+        return self._ready
 
     @property
     def preprocessor(self) -> ImagePreprocessor:
         """Le préprocesseur d'images associé au moteur."""
         return self._preprocessor
 
-    @property
-    def preprocess_options(self) -> dict[str, Any]:
-        """Copie des options de prétraitement appliquées avant chaque inférence."""
-        return dict(self._preprocess_kwargs)
-
     def warm_up(self) -> None:
-        """Force le chargement des poids en mémoire (modèles disponibles).
+        """Préchauffe les sessions ONNX (poids en RAM, graph JIT compilé).
 
-        Exécute une inférence sur un blank minimal et, si ``enable_roi``,
-        préchauffe aussi le prédicteur de reconnaissance seule.
+        Exécute une transcription sur une image de test synthétique : la
+        première requête utilisateur n'encaisse ni chargement de fichiers ni
+        compilation du graphe.
         """
-        if self._ocr is None:
-            raise OCRInitError("Le moteur OCR n'est pas initialisé.")
-        blank: np.ndarray = np.full((96, 96, 3), 255, dtype=np.uint8)
+        blank: np.ndarray = np.zeros((96, 96, 3), dtype=np.uint8)
+        blank[:] = 255
+        cv2.rectangle(blank, (10, 40), (86, 60), (10, 10, 10), -1)
+        htr = self._htr
         try:
-            self._run_ocr(blank)
+            assert htr is not None
+            htr.recognize(blank)
             self._ready = True
             self.logger.info(
-                "Modèles OCR pré-chargés (threads=%d, processus=%d, mkldnn=%s).",
+                "Sessions TrOCR pré-chargées (threads=%d).",
                 self.cpu_threads,
-                self._total_process_num,
-                self.use_mp,
             )
         except Exception as exc:
             self._ready = False
-            self.logger.warning("Warm-up OCR échoué (%s) ; chargement différé.", exc)
-        if self._enable_roi:
-            try:
-                predictor = self._ensure_rec_predictor()
-                if predictor is not None:
-                    list(predictor.predict(blank))
-                    self.logger.info("Prédicteur ROI (rec-only) pré-chaudé.")
-            except Exception as exc:
-                self.logger.warning("Warm-up ROI échoué: %s", exc)
+            self.logger.warning("Warm-up HTR échoué (%s).", exc)
 
-    # --- OCR globale (page unique) ------------------------------------- #
+    # --- OCR globale (page unique) ------------------------------------ #
     def predict_array(
         self,
         image: np.ndarray,
         *,
         preprocess: bool = True,
+        rois: Optional[ROIProfile] = None,
+        scan_barcode: Optional[bool] = None,
+        zones: Optional[bool] = None,
     ) -> list[OCRResultItem]:
-        """Exécute l'OCR sur un tableau numpy (une seule page)."""
-        if self._ocr is None:
+        """Exécute l'HTR sur un tableau numpy (une seule page).
+
+        Args:
+            image: Image BGR/GRAY 8 bits.
+            preprocess: Applique le pipeline OpenCV (CLAHE/Otsu/deskew).
+            rois: Profil de zones d'intérêt. Chaque zone nommée est transcrite
+                individuellement (une inférence par zone, les zones vides sont
+                ignorées) et les items résultants portent ``label`` +
+                ``box`` (repère page).
+            scan_barcode: Détection de codes-barres/QR avant l'OCR (défaut:
+                réglage du moteur).
+            zones: Lecture du formulaire **zone par zone** (OpenCV + chiffres
+                MNIST via :mod:`scriptvault.image_processing`) au lieu de la
+                passe ``_run_ocr`` pleine page. ``None`` = auto, ``False`` =
+                forcé pleine page.
+        """
+        if not self._ready:
             raise OCRInitError("Le moteur OCR n'est pas initialisé.")
         try:
+            if rois:
+                result = self._predict_page_array(
+                    image, 0, preprocess, rois, scan_barcode, zones
+                )
+                return result["items"]
+            if zones is not False:
+                from .image_processing import has_form_structure, read_exam_form_zones
+
+                if has_form_structure(image):
+                    return read_exam_form_zones(image, self._recognize_crop)
             if preprocess:
                 image = self._preprocessor.preprocess(image, **self._preprocess_kwargs)
             return self._run_ocr(image)
@@ -1272,7 +1193,7 @@ class LocalOCREngine:
             raise
         except cv2.error as exc:
             raise OCRImageError(f"Erreur OpenCV pendant l'OCR: {exc}") from exc
-        except Exception as exc:
+        except OCRBaseError as exc:
             raise OCRInferenceError(
                 f"Échec de l'inférence OCR: {type(exc).__name__}: {exc}"
             ) from exc
@@ -1307,26 +1228,26 @@ class LocalOCREngine:
         preprocess: bool = True,
         rois: Optional[ROIProfile] = None,
         scan_barcode: Optional[bool] = None,
+        zones: Optional[bool] = None,
     ) -> list[PageResult]:
         """Analyse **toutes** les pages d'un fichier (TIF multi-pages).
 
         Args:
             image_path: Chemin du fichier image.
             preprocess: Applique le pipeline OpenCV (CLAHE/Otsu/deskew/resize).
-            rois: Profil de zones d'intérêt. Si fourni, l'OCR global est
-                remplacé par une reconnaissance seule (``det=False``) sur
-                chaque zone nommée — ~70 % de calcul en moins sur les
-                formulaires structurés.
-            scan_barcode: Active la détection locale de codes-barres/QR
-                (défaut : option du moteur).
+            rois: Profil de zones d'intérêt. Si fourni, chaque zone nommée est
+                transcrite individuellement (une inférence par zone) — les
+                zones sans encre sont ignorées.
+            scan_barcode: Active la détection locale de codes-barres/QR.
+            zones: Lecture zonal du formulaire (voir :meth:`predict_array`).
 
         Returns:
             Un :class:`PageResult` par page. ``image`` = image exactement
-            analysée (prétraitée, zones masquées) — boîtes alignées.
+            analysée (prétraitée, zones code-barres masquées).
         """
         pages = self._preprocessor.read_pages(image_path)
         return [
-            self._predict_page_array(page, index, preprocess, rois, scan_barcode)
+            self._predict_page_array(page, index, preprocess, rois, scan_barcode, zones)
             for index, page in enumerate(pages, start=1)
         ]
 
@@ -1337,15 +1258,15 @@ class LocalOCREngine:
         preprocess: bool = True,
         rois: Optional[ROIProfile] = None,
         scan_barcode: Optional[bool] = None,
+        zones: Optional[bool] = None,
     ) -> list[PageResult]:
         """Identique à :meth:`predict_pages` pour des octets bruts."""
         pages = self._preprocessor.read_pages_bytes(data)
         return [
-            self._predict_page_array(page, index, preprocess, rois, scan_barcode)
+            self._predict_page_array(page, index, preprocess, rois, scan_barcode, zones)
             for index, page in enumerate(pages, start=1)
         ]
 
-    # ------------------------------------------------------------------ #
     def _predict_page_array(
         self,
         page: np.ndarray,
@@ -1353,6 +1274,7 @@ class LocalOCREngine:
         preprocess: bool,
         rois: Optional[ROIProfile],
         scan_barcode: Optional[bool],
+        zones: Optional[bool] = None,
     ) -> PageResult:
         started = time.perf_counter()
 
@@ -1365,7 +1287,7 @@ class LocalOCREngine:
                 self.logger.warning(
                     "Scanneur code-barres non configuré (barcode=False)."
                 )
-            else:
+            if scanner is not None:
                 try:
                     barcodes = scanner.scan(page)
                 except Exception as exc:
@@ -1374,11 +1296,10 @@ class LocalOCREngine:
             if barcodes:
                 page = mask_barcodes(page, barcodes)
 
-        # --- 2. Prétraitement --------------------------------------------------
+        # --- 2) Prétraitement --------------------------------------------- #
         if preprocess:
             if rois:
-                # Les ROI sont exprimées en fractions de la page ; on désactive
-                # le deskew pour préserver l'alignement des coordonnées.
+                # Robot résistent au deskew : les coordonnées ROI restent alignées.
                 kwargs = dict(self._preprocess_kwargs)
                 kwargs["deskew"] = False
                 kwargs["denoise"] = False
@@ -1392,7 +1313,7 @@ class LocalOCREngine:
 
         height, width = processed.shape[:2]
 
-        # --- 3. Inférence (OCR global ou ROI rec-only) --------------------- #
+        # --- 3) Inférence (OCR par ROI ou par lignes) --------------------- #
         if rois:
             items: list[OCRResultItem] = []
             for label, fraction in rois.items():
@@ -1403,105 +1324,89 @@ class LocalOCREngine:
                 for entry in self._recognize_crop(crop):
                     box = entry.get("box") or [
                         [0, 0],
-                        [x1 - x0, 0],
-                        [x1 - x0, y1 - y0],
-                        [0, y1 - y0],
+                        [crop.shape[1], 0],
+                        [crop.shape[1], crop.shape[0]],
+                        [0, crop.shape[0]],
                     ]
                     entry["box"] = [[x0 + p[0], y0 + p[1]] for p in box]
                     entry["label"] = label
                     items.append(entry)
         else:
-            items = self._run_ocr(processed)
+            if zones is not False:
+                from .image_processing import has_form_structure, read_exam_form_zones
+
+                if has_form_structure(page):
+                    items = read_exam_form_zones(page, self._recognize_crop)
+                    processed = page
+                    height, width = page.shape[:2]
+                else:
+                    items = self._run_ocr(processed)
+            else:
+                items = self._run_ocr(processed)
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         return make_page_result(
             page_number, width, height, items, elapsed_ms, barcodes, processed
         )
 
+    # ------------------------------------------------------------------ #
+    # Reconnaissance
+    # ------------------------------------------------------------------ #
+    def _run_ocr(self, image: np.ndarray) -> list[OCRResultItem]:
+        """Transcrit la page : lignes détectées, triées en lecture naturelle."""
+        # Prune : une page entièrement blanche (ou sans encre) ne coûte rien.
+        if _dark_ratio(image) < self._min_ink_ratio:
+            return []
+        lines = self._detector.detect_lines(image)
+        entries: list[OCRResultItem] = []
+        for line in sorted(lines, key=_line_sort_key):
+            crop = image[line.y0 : line.y1, line.x0 : line.x1]
+            text, confidence = self._transcribe(crop)
+            if not text:
+                continue
+            entries.append({"text": text, "confidence": confidence, "box": line.box})
+        return entries
+
     def _recognize_crop(self, crop: np.ndarray) -> list[OCRResultItem]:
-        """Reconnaissance seule (détection désactivée) sur une zone.
+        """Transcrit une zone (ROI) : une transcription directe par champ."""
+        text, confidence = self._transcribe(crop)
+        if not text:
+            return []
+        return [
+            {
+                "text": text,
+                "confidence": confidence,
+                "box": [
+                    [0, 0],
+                    [crop.shape[1], 0],
+                    [crop.shape[1], crop.shape[0]],
+                    [0, crop.shape[0]],
+                ],
+            }
+        ]
 
-        * PaddleOCR 2.x : ``ocr(crop, det=False, cls=False)``.
-        * PaddleOCR 3.x : prédicteur REC-Only ``paddlex`` (``TextRecPredictor``)
-          sur le dossier local des poids ; repli sur le pipeline complet si la
-          construction échoue.
-        """
-        if not self._api_v3:
-            try:
-                raw = self._ocr.ocr(crop, det=False, cls=False)
-            except (OCRBaseError, cv2.error):
-                raise
-            except Exception as exc:
-                raise OCRInferenceError(
-                    f"Échec reconnaissance ROI (2.x): {type(exc).__name__}: {exc}"
-                ) from exc
-            return self._parse_rec_only(raw, crop.shape)
-        predictor = self._ensure_rec_predictor()
-        if predictor is None:
-            return self._run_ocr(crop)
-        try:
-            results = list(predictor.predict(crop))
-            if not results:
-                return []
-            return self._parse_rec_only(results[0], crop.shape)
-        except Exception as exc:
-            self.logger.warning(
-                "Reconnaissance ROI échouée (%s), repli sur le pipeline global.",
-                exc,
-            )
-            return self._run_ocr(crop)
-
-    def _ensure_rec_predictor(self) -> Any:
-        """Construit (mis en cache) le prédicteur de reconnaissance seule 3.x."""
-        if self._rec_predictor is not None:
-            return self._rec_predictor if self._rec_predictor is not False else None
-        if not self._api_v3:
-            self._rec_predictor = False
-            return None
-        try:
-            from paddlex import create_predictor
-
-            name: Optional[str] = None
-            params = getattr(self._ocr, "_params", None)
-            if isinstance(params, dict):
-                name = params.get("text_recognition_model_name")
-            if not name:
-                raise OCRInitError(
-                    "Impossible de résoudre le nom du modèle de reconnaissance "
-                    "pour le mode ROI (det=False)."
-                )
-            if not self._rec_model_dir:
-                raise OCRInitError(
-                    "Dossier des modèles de reconnaissance non résolu (mode ROI)."
-                )
-            self._rec_predictor = create_predictor(
-                str(name), model_dir=self._rec_model_dir, device="cpu"
-            )
-            self.logger.info(
-                "Prédicteur REC-Only prêt (dossier=%s).", self._rec_model_dir
-            )
-        except Exception as exc:
-            # Repli : le pipeline complet (det+rec) reste utilisable sur le crop.
-            self._rec_predictor = False
-            self.logger.warning(
-                "Mode ROI détection désactivée indisponible, repli global: %s", exc
-            )
-        return self._rec_predictor if self._rec_predictor is not False else None
+    def _transcribe(self, crop: np.ndarray) -> tuple[str, float]:
+        """Transcrit une crop si elle contient de l'encre (sinon vide)."""
+        if crop.size == 0 or _dark_ratio(crop) < self._min_ink_ratio:
+            return "", 0.0
+        htr = self._htr
+        assert htr is not None
+        text, confidence = htr.recognize(crop)
+        return text.strip(), confidence
 
     # ------------------------------------------------------------------ #
+    # Cycle de vie
+    # ------------------------------------------------------------------ #
     def close(self) -> None:
-        """Libère les ressources (processus, modèles)."""
-        if self._ocr is not None:
-            release = getattr(self._ocr, "release", None)
-            if callable(release):
-                try:
-                    release()
-                except Exception as exc:
-                    self.logger.warning("Relâchement du moteur échoué: %s", exc)
-            self._ocr = None
-            self._ready = False
-            self._rec_predictor = None
-            self.logger.info("Moteur OCR fermé.")
+        """Libère les sessions ONNX et les ressources."""
+        htr = self._htr
+        if htr is not None:
+            try:
+                htr.close()
+            except Exception as exc:  # pragma: no cover - défensif
+                self.logger.warning("Fermeture du backend HTR échouée: %s", exc)
+            self._htr = None
+        self._ready = False
 
     def __enter__(self) -> "LocalOCREngine":
         return self
@@ -1509,178 +1414,10 @@ class LocalOCREngine:
     def __exit__(self, *exc_info: Any) -> None:
         self.close()
 
-    # ------------------------------------------------------------------ #
-    # Exécution et normalisation
-    # ------------------------------------------------------------------ #
-    def _run_ocr(self, image: np.ndarray) -> list[OCRResultItem]:
-        """Délègue l'inférence à PaddleOCR selon l'API détectée."""
-        if self._api_v3:
-            raw = self._ocr.predict(image)
-            return self._parse_v3(raw)
-        raw = self._ocr.ocr(image, cls=self.use_angle_cls)
-        return self._parse_v2(raw)
 
-    def _parse_v3(self, raw: Any) -> list[OCRResultItem]:
-        """Normalise la sortie PaddleOCR 3.x (liste d'objets dict-like)."""
-        entries: list[OCRResultItem] = []
-        pages = raw if isinstance(raw, (list, tuple)) else [raw]
-        for page in pages:
-            if page is None:
-                continue
-            if isinstance(page, dict) or hasattr(page, "get"):
-                d = page
-            elif hasattr(page, "__dict__"):
-                d = vars(page)
-            else:
-                d = {}
-            texts = d.get("rec_texts") or []
-            scores = d.get("rec_scores") or []
-            polys = d.get("rec_polys")
-            if polys is None:
-                polys = d.get("dt_polys")
-            if polys is None:
-                polys = []
-            for index, text in enumerate(texts):
-                box: Box = []
-                if index < len(polys):
-                    box = self._poly_to_box(polys[index])
-                score = float(scores[index]) if index < len(scores) else 0.0
-                entries.append(
-                    {
-                        "text": str(text),
-                        "confidence": min(1.0, max(0.0, score)),
-                        "box": box,
-                    }
-                )
-        return entries
-
-    def _parse_v2(self, raw: Any) -> list[OCRResultItem]:
-        """Normalise la sortie PaddleOCR 2.x (tuples imbriqués)."""
-        entries: list[OCRResultItem] = []
-        self._walk_v2(raw, entries)
-        return entries
-
-    @classmethod
-    def _walk_v2(cls, node: Any, out: list[OCRResultItem]) -> None:
-        """parcourt récursivement la structure 2.x et collecte les lignes."""
-        if not isinstance(node, (list, tuple)):
-            return
-        if len(node) >= 2 and cls._is_box(node[0]):
-            rest = node[1]
-            if isinstance(rest, (list, tuple)) and len(rest) >= 2:
-                try:
-                    text = str(rest[0])
-                    score = float(rest[1])
-                except (TypeError, ValueError):
-                    text, score = str(node[0]), 0.0
-                out.append(
-                    {
-                        "text": text,
-                        "confidence": min(1.0, max(0.0, score)),
-                        "box": cls._poly_to_box(node[0]),
-                    }
-                )
-                return
-        for item in node:
-            cls._walk_v2(item, out)
-
-    def _parse_rec_only(
-        self, raw: Any, shape: tuple[int, int, int]
-    ) -> list[OCRResultItem]:
-        """Parse la sortie « détection désactivée ».
-
-        Formats supportés :
-
-        * PaddleX 3.x rec-only : dict-like avec ``rec_text`` / ``rec_score``
-          (str ou list).
-        * PaddleOCR 2.x ``det=False`` : ``[[None, ('text', 'score')], ...]``,
-          ``['text', 0.9]`` ou tuples plats.
-        """
-        entries: list[OCRResultItem] = []
-        full_box: Box = [
-            [0, 0],
-            [shape[1], 0],
-            [shape[1], shape[0]],
-            [0, shape[0]],
-        ]
-
-        def add(text: Any, score: Any) -> None:
-            entries.append(
-                {
-                    "text": str(text),
-                    "confidence": min(1.0, max(0.0, float(score or 0.0))),
-                    "box": list(full_box),
-                }
-            )
-
-        if isinstance(raw, (dict,)) or hasattr(raw, "get"):
-            texts = raw.get("rec_text") or []
-            scores = raw.get("rec_score") or []
-            text_list = texts if isinstance(texts, (list, tuple)) else [texts]
-            score_list = (
-                scores
-                if isinstance(scores, (list, tuple))
-                else ([scores] * len(text_list))
-            )
-            for text, score in zip(text_list, score_list):
-                if text:
-                    add(text, score)
-            return entries
-        if not isinstance(raw, (list, tuple)):
-            return []
-
-        for node in raw:
-            if not isinstance(node, (list, tuple)):
-                continue
-            # Style [[None, (texte, score)], ...] (2.x det=False)
-            if len(node) == 2 and isinstance(node[0], type(None)):
-                rest = node[1]
-                if isinstance(rest, (list, tuple)) and len(rest) >= 1:
-                    add(rest[0], rest[1] if len(rest) > 1 else 0.0)
-                    continue
-            # Style ['texte', 0.9] / ('texte', 0.9)
-            if len(node) >= 2 and not self._is_box(node[0]):
-                add(node[0], node[1])
-                continue
-            # Style [[box], (texte, score)] (boîte éventuellement None)
-            if len(node) >= 2 and self._is_box(node[0]):
-                rest = node[1]
-                if isinstance(rest, (list, tuple)) and len(rest) >= 1:
-                    add(rest[0], rest[1] if len(rest) > 1 else 0.0)
-        return entries
-
-    @staticmethod
-    def _is_box(value: Any) -> bool:
-        """Vrai si ``value`` ressemble à une boîte (4+ points 2D)."""
-        if not isinstance(value, (list, tuple, np.ndarray)):
-            return False
-        try:
-            arr = np.asarray(value)
-        except Exception:
-            return False
-        if arr.ndim == 2 and arr.shape[1] == 2:
-            return arr.shape[0] >= 4
-        return arr.size >= 8 and arr.size % 2 == 0
-
-    @staticmethod
-    def _poly_to_box(poly: Any) -> Box:
-        """Convertit un polygone (quad ou 8 nombres) en ``[[x, y] * 4]``."""
-        try:
-            arr = np.asarray(poly, dtype=np.float32)
-        except (TypeError, ValueError):
-            return []
-        if arr.size == 0:
-            return []
-        if arr.ndim == 2 and arr.shape[1] == 2:
-            points = arr
-        else:
-            flat = arr.reshape(-1)
-            if flat.size % 2 != 0:
-                return []
-            points = flat.reshape(-1, 2)
-        return [
-            [int(round(float(x))), int(round(float(y)))] for x, y in points.tolist()
-        ]
+def _line_sort_key(line: Any) -> tuple[int, int]:
+    """Ordre de lecture naturel : haut→bas puis gauche→droite."""
+    return (line.y0, line.x0)
 
 
 # --------------------------------------------------------------------------- #
@@ -1689,12 +1426,12 @@ class LocalOCREngine:
 if __name__ == "__main__":
     import argparse
     import json
+    import sys
 
     parser = argparse.ArgumentParser(
-        description="OCR local hors-ligne (PaddleOCR CPU + OpenCV)."
+        description="HTR local hors-ligne (TrOCR ONNX CPU + OpenCV)."
     )
     parser.add_argument("image", help="Chemin de l'image à analyser (PNG, JPG, TIF…).")
-    parser.add_argument("--lang", default="en", help="Langue (en, fr, ch, ...).")
     parser.add_argument(
         "--no-preprocess",
         action="store_true",
@@ -1706,9 +1443,28 @@ if __name__ == "__main__":
         help="Active le mode zones d'intérêt (feuille d'examen).",
     )
     parser.add_argument(
+        "--roi-json",
+        default=None,
+        help=(
+            "Profil des zones d'intérêt en JSON "
+            '(ex. \'{"nom": [0.02, 0.09, 0.55, 0.14], "cin": [0.02, 0.23, 0.40, 0.28]}\'). '
+            "Les clés correspondent aux champs du gabarit (form_analyzer.FORM_FIELDS)."
+        ),
+    )
+    parser.add_argument(
         "--no-barcode",
         action="store_true",
         help="Désactive la détection de codes-barres/QR.",
+    )
+    parser.add_argument(
+        "--zones",
+        action="store_true",
+        help="Lecture par zones du formulaire (grilles + pointillés, jamais page entière).",
+    )
+    parser.add_argument(
+        "--no-zones",
+        action="store_true",
+        help="Force la passe pleine page (désactive le mode zones auto).",
     )
     parser.add_argument(
         "--max-side", type=int, default=0, help="Longueur max côté OCR (0 = auto)."
@@ -1719,12 +1475,31 @@ if __name__ == "__main__":
     parser.add_argument("--model-dir", default=None, help="Dossier local des modèles.")
     args = parser.parse_args()
 
+    rois: dict[str, tuple[float, float, float, float]] | None
+    if args.roi_json is not None:
+        try:
+            raw = json.loads(args.roi_json)
+        except json.JSONDecodeError as exc:
+            print(f"--roi-json invalide: {exc}", file=sys.stderr)
+            sys.exit(2)
+        rois = {
+            str(label): (
+                float(spec[0]),
+                float(spec[1]),
+                float(spec[2]),
+                float(spec[3]),
+            )
+            for label, spec in raw.items()
+            if isinstance(spec, (list, tuple)) and len(spec) == 4
+        }
+    else:
+        rois = DEFAULT_EXAM_ROIS if args.roi else None
+
     logging.basicConfig(
         level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s"
     )
 
     with LocalOCREngine(
-        lang=args.lang,
         model_dir=args.model_dir,
         cpu_threads=args.threads,
         max_side_len=args.max_side or None,
@@ -1732,11 +1507,13 @@ if __name__ == "__main__":
         pages = engine.predict_pages(
             args.image,
             preprocess=not args.no_preprocess,
-            rois=DEFAULT_EXAM_ROIS if args.roi else None,
+            rois=(rois if rois else None),
             scan_barcode=not args.no_barcode,
+            zones=(True if args.zones else (False if args.no_zones else None)),
         )
-
-    payload = [
-        {key: value for key, value in page.items() if key != "image"} for page in pages
-    ]
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+        payload = [
+            {key: value for key, value in page.items() if key != "image"}
+            for page in pages
+        ]
+        print(json.dumps({"backend": engine._backend_name, "pages": payload}))
+        sys.exit(0)

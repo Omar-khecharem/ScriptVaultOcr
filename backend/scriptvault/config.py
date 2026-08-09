@@ -41,13 +41,16 @@ def _env_csv(name: str, default: list[str]) -> list[str]:
 def _env_roi(
     name: str,
 ) -> dict[str, tuple[float, float, float, float]]:
-    """Analyse un profil de zones d'intérêt au format JSON.
+    """Analyse un profil de zones d'intérêt JSON (feuille d'examen).
 
     Exemple::
 
         SCRIPTVAULT_ROI='{"nom": [0.02, 0.09, 0.55, 0.14], "cin": [0.02, 0.23, 0.40, 0.28]}'
 
-    Chaque zone est une fraction normalisée ``(x0, y0, x1, y1)`` de la page.
+    Chaque zone est une fraction normalisée ``(x0, y0, x1, y1)`` de la page et
+    porte la clé d'un champ du gabarit (:data:`form_analyzer.FORM_FIELDS`).
+    Un profil non vide active la lecture par zones dans les traitements
+    par lots (les valeurs sont directement associées aux champs du formulaire).
     """
     raw = _env(name, "").strip()
     if not raw:
@@ -85,11 +88,12 @@ class Settings:
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
     )
 
-    # --- Moteur OCR ------------------------------------------------------
+# --- Moteur OCR ------------------------------------------------------
     lang: str = "en"
+    ocr_backend: str = "auto"  # "paddle" | "htr" | "auto" (paddle si installé)
     model_dir: str | None = None
     cpu_threads: int = 0  # 0 = auto (min(8, cœurs))
-    max_concurrency: int = 1  # inférences simultanées (1 = recommandé CPU)
+    max_concurrency: int = 0  # inférences simultanées (0 = auto: 1, CPU-safe)
     timeout_ms: int = 300_000  # délai maximal d'une image (0 = illimité)
     preload: bool = True  # pré-charge le moteur au démarrage
     preprocess: bool = True  # pipeline OpenCV par défaut (CLAHE/deskew/Otsu)
@@ -101,13 +105,12 @@ class Settings:
     # --- Haute résolution ------------------------------------------------
     max_side_len: int = 0  # longueur max côté OCR (0 = SCRIPTVAULT_MAX_SIDE / 1600)
 
-    # --- Lecture hybride (code-barres + ROI) ------------------------------
+    # --- Lecture hybride (code-barres + examen) ---------------------------
     barcode_enabled: bool = True  # scanner local code-barres / QR
     barcode_budget_ms: int = 15  # budget de détection par page
-    roi_enabled: bool = False  # préchauffe le prédicteur rec-only (det=False)
     roi_profile: dict[str, tuple[float, float, float, float]] = field(
         default_factory=dict
-    )  # profil de zones d'intérêt (JSON SCRIPTVAULT_ROI)
+    )  # zones du formulaire (JSON SCRIPTVAULT_ROI); non vide → OCR par zones
 
     # --- Règles métier & stockage -----------------------------------------
     storage_root: str = "STORAGE"  # racine de réorganisation des fichiers
@@ -153,9 +156,10 @@ class Settings:
                 ["http://localhost:5173", "http://127.0.0.1:5173"],
             ),
             lang=_env("SCRIPTVAULT_LANG", "en"),
+            ocr_backend=_env("SCRIPTVAULT_OCR_BACKEND", "auto").lower(),
             model_dir=_env("SCRIPTVAULT_MODEL_DIR", "") or None,
             cpu_threads=_env_int("SCRIPTVAULT_CPU_THREADS", 0),
-            max_concurrency=max(1, _env_int("SCRIPTVAULT_MAX_CONCURRENCY", 1)),
+            max_concurrency=max(1, _env_int("SCRIPTVAULT_MAX_CONCURRENCY", 0)),
             timeout_ms=max(0, _env_int("SCRIPTVAULT_TIMEOUT_MS", 300_000)),
             preload=_env_bool("SCRIPTVAULT_PRELOAD", True),
             preprocess=_env_bool("SCRIPTVAULT_PREPROCESS", True),
@@ -164,7 +168,6 @@ class Settings:
             max_side_len=max(0, _env_int("SCRIPTVAULT_MAX_SIDE", 1600)),
             barcode_enabled=_env_bool("SCRIPTVAULT_BARCODE", True),
             barcode_budget_ms=max(1, _env_int("SCRIPTVAULT_BARCODE_BUDGET_MS", 15)),
-            roi_enabled=_env_bool("SCRIPTVAULT_ROI_ENABLED", False),
             roi_profile=_env_roi("SCRIPTVAULT_ROI"),
             storage_root=_env("SCRIPTVAULT_STORAGE_ROOT", "STORAGE"),
             archive_encrypt=_env_bool("SCRIPTVAULT_ARCHIVE_ENCRYPT", False),
@@ -188,3 +191,17 @@ class Settings:
     @property
     def max_file_bytes(self) -> int:
         return self.max_file_mb * 1024 * 1024
+
+    @property
+    def effective_max_concurrency(self) -> int:
+        """Inférences simultanées résolues (0 = auto : 1, CPU-safe).
+
+        Les sessions onnxruntime consomment déjà tous les cœurs (16 threads
+        par inférence) : plusieurs inférences simultanées font de la sur-
+        réservation de threads et ralentissent le lot. Gardez 1 par défaut ;
+        sur une machine avec beaucoup de cœurs, ``SCRIPTVAULT_MAX_CONCURRENCY=2``
+        peut aider si les cœurs le permettent.
+        """
+        if self.max_concurrency > 0:
+            return self.max_concurrency
+        return 1

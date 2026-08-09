@@ -249,6 +249,45 @@ def test_cin_nearest_digit_window():
     assert cin.value == "09728320"
 
 
+def test_cin_first_digit_must_be_0_or_1():
+    """Règle métier : le CIN tunisien commence par 0 ou 1."""
+    for bad in ("89728320", "29728320", "76706906"):
+        response = _analyze([("N° CIN :", bad)])
+        cin = _by_key(response)["cin"]
+        assert cin.status == FieldStatus.ERROR, bad
+        assert "0 ou 1" in (cin.error_message or ""), bad
+    for good in ("09728320", "19728320"):
+        response = _analyze([("N° CIN :", good)])
+        assert _by_key(response)["cin"].status == FieldStatus.VALID, good
+
+
+def test_cin_first_digit_0_or_1_after_correction():
+    """Le premier chiffre corrigé (O→0, I→1) satisfait la règle."""
+    response = _analyze([("N° CIN :", "O972832O")])
+    cin = _by_key(response)["cin"]
+    assert cin.status == FieldStatus.VALID
+    assert cin.value == "09728320"
+    response = _analyze([("N° CIN :", "I972832O")])
+    cin = _by_key(response)["cin"]
+    assert cin.status == FieldStatus.VALID
+    assert cin.value == "19728320"
+
+
+def test_cin_harvest_prefers_leading_0_or_1():
+    """Parmi plusieurs numéros sur la page, le CIN (0/1 en tête) gagne."""
+    from scriptvault.form_analyzer import analyze_form_items
+
+    items = [
+        {"text": "N° CIN :", "confidence": 0.99, "box": [[0, 0], [80, 0], [80, 12], [0, 12]]},
+        {"text": "89728320", "confidence": 0.99, "box": [[120, 0], [220, 0], [220, 12], [120, 12]]},
+        {"text": "09728320", "confidence": 0.99, "box": [[120, 40], [220, 40], [220, 52], [120, 52]]},
+    ]
+    response = analyze_form_items(items, file_name="harvest.png")
+    cin = _by_key(response)["cin"]
+    assert cin.status == FieldStatus.VALID
+    assert cin.value == "09728320"
+
+
 def test_date_iso_format_is_normalized():
     """« 2003-12-04 » (ISO) → 04/12/2003, accepté sans erreur."""
     response = _analyze([("Date de naissance :", "2003-12-04")])
@@ -326,6 +365,54 @@ def test_anonymat_field_accepts_digits():
 # --------------------------------------------------------------------------- #
 # Gabarit permanent (mode "include_placeholders")
 # --------------------------------------------------------------------------- #
+def test_labeled_roi_items_feed_fields_directly():
+    """Items pré-étiquetés (lecture par zones) : la valeur du carré EST le
+    champ, même à très faible confiance OCR — aucun appariement spatial."""
+    items = [
+        {
+            "label": "nom",
+            "text": "Didi",
+            "confidence": 0.11,
+            "box": [[14, 81], [392, 81], [392, 126], [14, 126]],
+        },
+        {
+            "label": "date_naissance",
+            "text": "12/05/2002 Tunis",
+            "confidence": 0.55,
+            "box": [[14, 240], [380, 240], [380, 300], [14, 300]],
+        },
+    ]
+    response = LocalFormAnalyzer().analyze_page(items, file_name="roi.png")
+    by_key = _by_key(response)
+    assert by_key["nom"].value
+    assert by_key["nom"].status in (FieldStatus.VALID, FieldStatus.WARNING)
+    assert by_key["date_naissance"].value.startswith("12/05/2002")
+    assert by_key["date_naissance"].status in (
+        FieldStatus.VALID,
+        FieldStatus.WARNING,
+    )
+
+
+def test_labeled_roi_ignores_garbage_lines():
+    """Le chemin ROI ignore les items sans label : une ligne parasite
+    (« bruit » TrOCR) ne peut ni remplacer ni polluer les champs lus."""
+    items = [
+        {
+            "label": "cin",
+            "text": "09728365",
+            "confidence": 0.62,
+            "box": [[10, 10], [300, 10], [300, 60], [10, 60]],
+        },
+        {
+            "text": "in the United States's",
+            "confidence": 0.90,
+            "box": [[80, 620], [600, 620], [600, 660], [80, 660]],
+        },
+    ]
+    response = LocalFormAnalyzer().analyze_page(items, file_name="roi2.png")
+    by_key = _by_key(response)
+    assert by_key["cin"].value == "09728365"
+    assert by_key["cin"].status in (FieldStatus.VALID, FieldStatus.WARNING)
 def test_complete_mode_returns_all_gabarit_fields():
     """Mode complet : le gabarit FIXE (11 champs), non lus en statut empty."""
     response = LocalFormAnalyzer().analyze_page(
@@ -426,10 +513,10 @@ def test_name_unmatched_ocr_noise_is_error():
 
 
 def test_birth_extracts_best_date_and_city():
-    """« née le 04/12/1993 à Tnus » → 04/12/1993 · Tunis."""
+    """« née le 04/12/1993 à Tnus » → 04/12/1993 · Tnus (lieu structuré)."""
     response = _analyze([("Date & lieu de naissance :", "nee le 04/12/1993 a Tnus")])
     field = _by_key(response)["date_naissance"]
-    assert field.value == "04/12/1993 · Tunis"
+    assert field.value == "04/12/1993 · Tnus"
     assert field.status == FieldStatus.VALID
 
 
@@ -458,18 +545,25 @@ def test_etablissement_known_is_valid():
     assert _by_key(response)["etablissement"].status == FieldStatus.VALID
 
 
-def test_etablissement_suspicious_is_warning():
+def test_etablissement_unknown_acronym_is_valid():
+    """Un acronyme inconnu mais bien formé reste valide (aucun lexique)."""
     response = _analyze([("Établissement d'origine :", "ZZZZ")])
+    assert _by_key(response)["etablissement"].status == FieldStatus.VALID
+
+
+def test_etablissement_with_digits_is_warning():
+    """Chiffres résiduels dans l'acronyme → suspect (ex. TLE1B)."""
+    response = _analyze([("Établissement d'origine :", "TLE1B")])
     field = _by_key(response)["etablissement"]
     assert field.status == FieldStatus.WARNING
     assert "suspect" in (field.error_message or "")
 
 
-def test_etablissement_ocr_noise_corrected_via_lexicon():
-    """« TLEIB » → rapproché de la prépa IPEIB (Bizerte), champ valide."""
+def test_etablissement_clean_structure_is_valid():
+    """« TLEIB » reste lisible et valide (aucun rapprochement lexique)."""
     response = _analyze([("Établissement d'origine :", "TLEIB")])
     field = _by_key(response)["etablissement"]
-    assert field.value == "IPEIB"
+    assert field.value == "TLEIB"
     assert field.status == FieldStatus.VALID
 
 
@@ -620,10 +714,10 @@ def test_birth_noisy_ocr_date_reversed_day():
 
 
 def test_birth_noisy_ocr_date_with_city():
-    """« née Bo/09|&00.3 à Tnus » → 08/09/2003 · Tunis."""
+    """« née Bo/09|&00.3 à Tnus » → 08/09/2003 · Tnus (lieu structuré)."""
     response = _analyze([("Date & lieu de naissance :", "nee Bo/09|&00.3 a Tnus")])
     field = _by_key(response)["date_naissance"]
-    assert field.value == "08/09/2003 · Tunis"
+    assert field.value == "08/09/2003 · Tnus"
     assert field.status == FieldStatus.VALID
 
 
@@ -850,7 +944,7 @@ def test_eya_elloumi_document_all_green():
     assert by_key["date_concours"].status == FieldStatus.VALID
     assert by_key["duree"].value == "4 Heures"
     assert by_key["duree"].status == FieldStatus.VALID
-    assert by_key["nom"].value == "Elloumi"
+    assert by_key["nom"].value == "Elloom"
     assert by_key["nom"].status == FieldStatus.VALID
     assert by_key["prenom"].value == "Eya"
     assert by_key["prenom"].status == FieldStatus.VALID

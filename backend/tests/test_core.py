@@ -1,4 +1,4 @@
-"""Tests unitaires du moteur OCR — sans PaddlePaddle (import léger)."""
+"""Tests unitaires du moteur OCR — sans chargement des modèles ONNX (import léger)."""
 
 from pathlib import Path
 
@@ -9,7 +9,6 @@ from scriptvault import __version__ as scriptvault_version
 from scriptvault import core_ocr
 from scriptvault.core_ocr import (
     ImagePreprocessor,
-    LocalOCREngine,
     OCRBaseError,
     OCRImageError,
     OCRInitError,
@@ -126,82 +125,55 @@ def test_read_image_missing_raises(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- #
-# Normalisation des sorties (parseurs 2.x / 3.x)
+# Zones manuscrites : pipeline adaptatif
 # --------------------------------------------------------------------------- #
-def test_poly_to_box_variants():
-    proc = LocalOCREngine
-    assert proc._poly_to_box([10, 20, 30, 20, 30, 40, 10, 40]) == [
-        [10, 20],
-        [30, 20],
-        [30, 40],
-        [10, 40],
-    ]
-    quad = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float32)
-    box = proc._poly_to_box(quad)
-    assert len(box) == 4 and box[0] == [0, 0]
-    assert proc._poly_to_box([]) == []
-    assert proc._poly_to_box("invalide") == []
+def _handwritten_image() -> np.ndarray:
+    """Image « copie scannée » : texte sombre, fond taché + ombre en coin."""
+    h, w = 320, 700
+    img = np.full((h, w, 3), 200, dtype=np.uint8)
+    cv2.putText(
+        img, "Didi Elloumi", (40, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (45, 45, 45), 3
+    )
+    cv2.rectangle(img, (0, 0), (220, 90), (150, 155, 160), -1)  # ombre
+    return img
 
 
-class _ResultLike:
-    """Reproduit ``paddlex.inference.pipelines.ocr.result.OCRResult``:
-    dict-like avec ``get()`` mais sans attributs ``__dict__``."""
-
-    def __init__(self, data):
-        object.__setattr__(self, "_data", data)
-
-    def get(self, key, default=None):
-        return self._data.get(key, default)
-
-    def __getattr__(self, name):
-        raise AttributeError(name)
+def test_preprocess_handwritten_outputs_bgr8():
+    img = _handwritten_image()
+    out = ImagePreprocessor().preprocess_handwritten(img)
+    assert out.shape[:2] == img.shape[:2]
+    assert out.dtype == np.uint8
+    assert out.shape[2] == 3
 
 
-def _parse_instance():
-    """Instance légère de LocalOCREngine (sans PaddlePaddle) pour les
-    parseurs purs."""
-    return object.__new__(LocalOCREngine)
+def test_preprocess_handwritten_normalizes_dark_background():
+    """Un fond sombre (ombre) est ramené vers un fond clair: l'encre seule
+    doit rester sombre — moyenne du résultat nettement au-dessus de 127."""
+    img = _handwritten_image()
+    out = ImagePreprocessor().preprocess_handwritten(img)
+    assert out.mean() > 127.0
 
 
-def test_parse_v3_dictlike():
-    raw = [
-        _ResultLike(
-            {
-                "rec_texts": ["Bonjour", "Monde"],
-                "rec_scores": [0.99, 0.85],
-                "rec_polys": [
-                    [[0, 0], [50, 0], [50, 10], [0, 10]],
-                    [[0, 20], [40, 20], [40, 30], [0, 30]],
-                ],
-            }
-        )
-    ]
-    entries = _parse_instance()._parse_v3(raw)
-    assert [e["text"] for e in entries] == ["Bonjour", "Monde"]
-    assert entries[0]["confidence"] == pytest.approx(0.99)
-    assert entries[0]["box"] == [[0, 0], [50, 0], [50, 10], [0, 10]]
+def test_preprocess_handwritten_grayscale_input():
+    """Entrée en niveau de gris (2D) acceptée et sortie BGR."""
+    gray = cv2.cvtColor(_handwritten_image(), cv2.COLOR_BGR2GRAY)
+    out = ImagePreprocessor().preprocess_handwritten(gray)
+    assert out.ndim == 3 and out.shape[2] == 3
 
 
-def test_parse_v3_plain_dict_and_dt_polys():
-    raw = [
-        {
-            "rec_texts": ["X"],
-            "rec_scores": [1.0],
-            "dt_polys": [[[1, 1], [2, 1], [2, 2], [1, 2]]],
-        }
-    ]
-    entries = _parse_instance()._parse_v3(raw)
-    assert entries[0]["text"] == "X"
-    assert entries[0]["box"] == [[1, 1], [2, 1], [2, 2], [1, 2]]
+def test_preprocess_handwritten_components_optional():
+    img = _handwritten_image()
+    base = ImagePreprocessor().preprocess_handwritten(img, binarize=False)
+    assert base.dtype == np.uint8
+    stroked = ImagePreprocessor().preprocess_handwritten(
+        img, structural=True, binarize=False
+    )
+    assert stroked.shape == base.shape
 
 
-def test_parse_v3_empty():
-    assert _parse_instance()._parse_v3([None, {}]) == []
-
-
-def test_parse_v2_nested():
-    box = [[0, 0], [10, 0], [10, 10], [0, 10]]
-    raw = [[[box, ("Hello", 0.99)]], [[box, ("World", 0.8)]]]
-    entries = _parse_instance()._parse_v2(raw)
-    assert [e["text"] for e in entries] == ["Hello", "World"]
-    assert entries[1]["confidence"] == pytest.approx(0.8)
+def test_preprocess_handwritten_preserves_ink():
+    """L'encre sombre (le texte) ne doit pas être effacée par la suppression
+    d'ombre: il reste toujours du noir significatif sur l'image finale."""
+    img = _handwritten_image()
+    out = ImagePreprocessor().preprocess_handwritten(img)
+    assert (out < 100).sum() > 500

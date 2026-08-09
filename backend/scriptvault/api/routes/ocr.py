@@ -267,7 +267,7 @@ async def ocr_batch(
         except OCRImageError as exc:
             validated.append((upload, b"", str(exc)))
 
-    semaphore = asyncio.Semaphore(max(1, settings.max_concurrency))
+    semaphore = asyncio.Semaphore(max(1, settings.effective_max_concurrency))
 
     async def process(
         upload: UploadFile, data: bytes, error: Optional[str]

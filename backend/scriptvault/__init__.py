@@ -1,14 +1,13 @@
-"""ScriptVault OCR — moteur et API serveur (partagés avec le desktop).
+"""ScriptVault OCR — moteur et API serveur.
 
-Le package ``scriptvault`` contient le moteur OCR local (PaddleOCR CPU +
-OpenCV), les services de rasterisation PDF et d'export, ainsi que l'API
-HTTP FastAPI qui les expose au client web.
+Le package ``scriptvault`` contient le moteur HTR local (TrOCR ONNX Runtime +
+OpenCV), les services de rasterisation PDF et d'export, l'analyseur de
+formulaires (avec correcteur de niveau caractère, sans lexique), ainsi que
+l'API HTTP FastAPI qui les expose au client web.
 
-Il est consommé par deux clients distincts:
+Clients :
 
-* ``desktop/``  — application PySide6 (``pip install -e backend`` puis
-  ``pip install -r desktop/requirements.txt``) ;
-* ``web/``      — interface React/Vite qui parle uniquement à l'API REST.
+* ``web/`` — interface React/Vite qui parle uniquement à l'API REST.
 """
 
 from __future__ import annotations

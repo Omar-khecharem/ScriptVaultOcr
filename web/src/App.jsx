@@ -542,8 +542,13 @@ export default function App() {
             </div>
           </section>
 
-          {/* ----- Colonne droite : formulaire (sans éditeur de texte) ---- */}
-          <FormPanel form={form} />
+          {/* ----- Colonne droite : formulaire éditable (sans éditeur de texte) ---- */}
+          <FormPanel
+            form={form}
+            jobId={jobId}
+            fileId={selectedId}
+            pageNumber={pageIndex + 1}
+          />
         </div>
       </main>
 

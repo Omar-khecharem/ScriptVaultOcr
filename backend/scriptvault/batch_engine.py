@@ -104,6 +104,7 @@ class BatchFile:
         "confidence",
         "elapsed_ms",
         "preview_cache",
+        "form_overrides",
     )
 
     def __init__(
@@ -119,6 +120,9 @@ class BatchFile:
         self.confidence = 0.0
         self.elapsed_ms = 0.0
         self.preview_cache: "OrderedDict[int, str]" = OrderedDict()
+        #: Corrections manuelles du formulaire : ``{page: {clé: valeur}}``
+        #: appliquées en dernier recours (UI) et reprises par l'export Excel.
+        self.form_overrides: dict[int, dict[str, str]] = {}
 
     def to_summary(self) -> dict[str, Any]:
         """Métadonnées légères pour la liste paginée (sans contenu OCR)."""
@@ -315,7 +319,9 @@ class BatchManager:
     async def init(self, engines: EngineManager) -> None:
         """Borne la concurrence globale et attache le pool de moteurs."""
         self._engines = engines
-        self._semaphore = asyncio.Semaphore(max(1, self._settings.max_concurrency))
+        self._semaphore = asyncio.Semaphore(
+            max(1, self._settings.effective_max_concurrency)
+        )
 
     # ------------------------------------------------------------------ #
     def create_job(
@@ -471,12 +477,24 @@ class BatchManager:
             processed = image
         engines = self._engines
         assert engines is not None
-        items = await engines.predict_array(processed, lang=job.lang, preprocess=False)
-        height, width = processed.shape[:2]
+        rois = self._settings.roi_profile or None
+        if rois is not None:
+            items = await engines.predict_array(
+                image,
+                lang=job.lang,
+                preprocess=True,
+                rois=rois,
+                scan_barcode=False,
+            )
+        else:
+            items = await engines.predict_array(
+                image, lang=job.lang, preprocess=True
+            )
+        height, width = image.shape[:2]
         form = analyze_form_items(
             items,
             file_name=job.name,
-            image=processed,
+            image=image,
             include_placeholders=True,
         )
         self._persist_page_preview(file, processed, page_number)

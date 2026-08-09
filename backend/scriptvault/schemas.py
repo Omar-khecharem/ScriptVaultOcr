@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -117,6 +117,14 @@ class FormFieldResult(BaseModel):
     bounding_box: Optional[list[list[int]]] = None
     section: FormSection = FormSection.CANDIDAT
     section_label: str = ""
+    corrections: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Trace de la correction au niveau des caractères, si la valeur "
+            "brute OCR a été déconfondue : ``{original, kind, confidence}``. "
+            "Aucun lexique statique n'est consulté."
+        ),
+    )
 
 
 class FormAnalyzeRequest(BaseModel):
@@ -124,6 +132,17 @@ class FormAnalyzeRequest(BaseModel):
 
     file_name: str = Field(default="", max_length=255)
     items: list[OCRItem] = Field(default_factory=list)
+
+
+class FormOverrideRequest(BaseModel):
+    """Correction manuelle d'un formulaire (récupérée par la table Excel)."""
+
+    page: int = Field(ge=1, description="Numéro de page (1-based).")
+    values: dict[str, str] = Field(
+        default_factory=dict,
+        max_length=200,
+        description="Clés de champs (ex. ``nom``) associées à leur valeur corrigée.",
+    )
 
 
 class AnalyzedFormResponse(BaseModel):
@@ -149,3 +168,10 @@ class HealthResponse(BaseModel):
     max_concurrency: int
     lang: str
     uptime_s: float
+    corrections: dict[str, object] = Field(
+        default_factory=dict,
+        description=(
+            "État du correcteur de niveau caractère : ``{enabled, engine}`` "
+            "(aucun lexique n'est plus embarqué)."
+        ),
+    )

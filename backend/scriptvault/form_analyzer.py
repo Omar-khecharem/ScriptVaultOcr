@@ -41,11 +41,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional, Sequence
 
-from scriptvault.lexicons import (
-    TUNISIAN_CITIES,
-    TUNISIAN_FIRST_NAMES,
-    TUNISIAN_LAST_NAMES,
-)
+from scriptvault.char_corrector import default_char_corrector
 from scriptvault.schemas import (
     SECTION_LABELS,
     AnalyzedFormResponse,
@@ -103,39 +99,6 @@ DATE_YEAR_RANGE = (1950, 2026)
 _VALUE_KINDS: frozenset[str] = frozenset(
     {"cin", "serie", "identifiant", "nombre_cahiers", "anonyme"}
 )
-
-#: Établissements officiels (prépas tunisiennes + facultés à prépa intégrée)
-#: pour la validation par distance de Levenshtein.
-_ETABLISSEMENTS: tuple[str, ...] = (
-    # Instituts Préparatoires aux Études d'Ingénieurs (tous gouvernorats).
-    "IPEIN",
-    "IPEIT",
-    "IPEIM",
-    "IPEIS",
-    "IPEIB",
-    "IPEST",
-    "IPEES",
-    # Facultés avec cycle prépa intégré / filières d'ingénieur.
-    "FST",
-    "FSM",
-    "FSB",
-    "FSG",
-    "FSS",
-    # Autres établissements officiels (écoles d'ingénieurs, ISET, etc.).
-    "FGES",
-    "FSEG",
-    "FSEGN",
-    "FSEGT",
-    "INSAT",
-    "ENIT",
-    "ESPRIT",
-    "ISI",
-    "ISET",
-    "ISSAT",
-    "ISIT",
-)
-
-_ETABLISSEMENTS_SET: frozenset[str] = frozenset(_ETABLISSEMENTS)
 
 #: Marge d'encre minimale (fraction de pixels sombres) dans la zone de
 #: signature des enseignants pour considérer que la signature est présente.
@@ -296,27 +259,6 @@ def _box_rect(box: Any) -> tuple[float, float, float, float]:
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _levenshtein(a: str, b: str) -> int:
-    """Distance d'édition minimale entre deux chaînes (pure Python)."""
-    if not a:
-        return len(b)
-    if not b:
-        return len(a)
-    previous = list(range(len(b) + 1))
-    for i, ca in enumerate(a, start=1):
-        current = [i]
-        for j, cb in enumerate(b, start=1):
-            current.append(
-                min(
-                    current[-1] + 1,
-                    previous[j] + 1,
-                    previous[j - 1] + (0 if ca == cb else 1),
-                )
-            )
-        previous = current
-    return previous[-1]
-
-
 def _french_date_value(text: str) -> Optional[str]:
     """Date en toutes lettres → JJ/MM/AAAA (ex. « Lundi 03 Juin 2024 à 8 H »)."""
     span = _french_date_span(text)
@@ -461,18 +403,24 @@ def _best_date(text: str) -> Optional[tuple[str, int, int]]:
     return None
 
 
-def _nearest_digit_window(text: str, length: int = 8) -> Optional[str]:
+def _nearest_digit_window(
+    text: str, length: int = 8, leading: Optional[str] = None
+) -> Optional[str]:
     """La séquence de ``length`` chiffres la plus proche dans ``text``.
 
     Fenêtre glissante sur le texte sans espaces : chaque caractère est soit
     un chiffre (gardé), soit une confusion OCR (``O``→``0``…), soit une
     erreur. La fenêtre ayant le moins d'erreurs est retenue si elle reste
     raisonnable (au plus 2 erreurs) — ex. ``"0 9 7 28 320"`` → ``"09728320"``.
+
+    ``leading`` (ex. ``"01"`` pour un CIN tunisien) départage les fenêtres
+    à erreurs égales : celle dont le premier chiffre appartient à
+    ``leading`` est préférée, sans jamais exclure une autre candidature.
     """
     stripped = "".join(text.split())
     if len(stripped) < length:
         return None
-    best: Optional[tuple[int, str]] = None
+    best: Optional[tuple[int, int, str]] = None
     for index in range(len(stripped) - length + 1):
         window = stripped[index : index + length]
         errors = 0
@@ -485,41 +433,26 @@ def _nearest_digit_window(text: str, length: int = 8) -> Optional[str]:
                 errors += 1
             else:
                 errors += 2
-        if errors <= 2 and (best is None or errors < best[0]):
-            best = (errors, "".join(digits))
-    return best[1] if best is not None else None
+        if errors > 2:
+            continue
+        leading_ok = leading is None or (digits and digits[0] in leading)
+        candidate = (errors, 0 if leading_ok else 1, "".join(digits))
+        if best is None or candidate[:2] < best[:2]:
+            best = candidate
+    return best[2] if best is not None else None
 
 
-def _norm_key(text: str) -> str:
-    """Texte → MAJUSCULES sans accents ni ponctuation (clé de comparaison).
+def _correct_char_level(value: str, kind: str = "text", strict: bool = False) -> str:
+    """Correction structurelle par le modèle de caractères (sans lexique).
 
-    Les chiffres sont conservés : une lecture OCR comme ``"D1d1"`` reste
-    comparable au ``"Didi"`` du lexique.
+    Délègue au :class:`~scriptvault.char_corrector.CharCorrector` le
+    décodage probabiliste (Viterbi borné) du segment OCR. La valeur est
+    remplacée uniquement si le modèle la juge fiable (``strict``).
     """
-    value = unicodedata.normalize("NFKD", text.strip())
-    value = "".join(ch for ch in value if not unicodedata.combining(ch))
-    return re.sub(r"[^A-Z0-9]+", "", value.upper())
-
-
-def _closest_lexicon(value: str, lexicon: frozenset[str]) -> Optional[str]:
-    """L'entrée du lexique la plus proche de ``value`` (distance <= 2).
-
-    Les mots très courts (< 3 caractères) ne déclenchent pas de correction
-    (sauf correspondance exacte) : ``"a"`` ne doit jamais devenir une ville.
-    """
-    target = _norm_key(value)
-    if not target:
-        return None
-    best: Optional[tuple[str, int]] = None
-    for candidate in lexicon:
-        distance = _levenshtein(target, _norm_key(candidate))
-        if best is None or distance < best[1]:
-            best = (candidate, distance)
-    if best is None or best[1] > 2:
-        return None
-    if best[1] > 0 and len(target) < 3:
-        return None
-    return best[0]
+    if not value:
+        return value
+    prediction = default_char_corrector().correct(value, kind, strict=strict)
+    return prediction.value if prediction.changed else value
 
 
 # --------------------------------------------------------------------------- #
@@ -847,6 +780,35 @@ class LocalFormAnalyzer:
         parsed: list[dict[str, Any]] = []
         consumed: set[int] = set()
 
+        # Passe 0 — items pré-étiquetés (lecture par zones d'intérêt) : le
+        # champ est connu d'avance, la transcription du carré EST sa valeur.
+        # Aucun appariement spatial ne s'applique. La confiance moyenne par
+        # token de TrOCR est pessimiste : un plancher (warning) est appliqué
+        # pour ne pas étiqueter en erreur une lecture de zone correcte.
+        _ROI_CONFIDENCE_FLOOR = 0.70
+        remainder: list[dict[str, Any]] = []
+        for item in items:
+            text = str(item.get("text", "")).strip()
+            label_key = str(item.get("label", "")).strip()
+            if not text or not label_key:
+                remainder.append(item)
+                continue
+            spec = _SPEC_BY_KEY.get(label_key)
+            if spec is None:
+                remainder.append(item)
+                continue
+            parsed.append(
+                self._build_field(
+                    spec,
+                    text,
+                    max(_ROI_CONFIDENCE_FLOOR, float(item.get("confidence", 0.0))),
+                    item.get("box") or [],
+                )
+            )
+        if not remainder:
+            return parsed
+        items = remainder
+
         # Pré-traitement : normalisation + rectangles englobants.
         entries: list[dict[str, Any]] = []
         for item in items:
@@ -947,7 +909,15 @@ class LocalFormAnalyzer:
                     if digits_count in (3, 4):
                         continue
                 elif not self._needs_harvest(field["value"], length):
-                    continue
+                    # Un CIN lu de 8 chiffres mais dont le premier chiffre
+                    # n'est pas 0/1 (règle tunisienne) mérite quand même une
+                    # seconde lecture de la page : le chiffre de tête est le
+                    # plus souvent confondu par l'OCR.
+                    if not (
+                        key == "cin"
+                        and not self._validate_cin(field["value"])[0]
+                    ):
+                        continue
             spec = _SPEC_BY_KEY[key]
             label_index = self._find_label_index(entries, spec)
             if label_index is None:
@@ -971,6 +941,10 @@ class LocalFormAnalyzer:
                     score = penalty * 1000.0 + (
                         self._rect_distance(label_rect, entry["rect"]) / 2000.0
                     )
+                    # CIN (8 chiffres) : un numéro dont le premier chiffre
+                    # est 0 ou 1 (format tunisien) sort toujours gagnant.
+                    if key == "cin" and window and window[0] not in "01":
+                        score += 400.0
                     if best is None or score < best[0]:
                         best = (score, index, window, entry)
             if best is None:
@@ -983,10 +957,18 @@ class LocalFormAnalyzer:
             )
             if len(digits) <= length + 2:
                 consumed.add(index)  # un seul numéro dans l'item
-            parsed.append(
-                self._build_field(spec, run, entry["confidence"], entry["box"])
+            candidate = self._build_field(
+                spec, run, entry["confidence"], entry["box"]
             )
-            by_key[key] = parsed[-1]
+            if field is not None:
+                # Un champ déjà lu (ex. CIN 89728320) est REPLACÉ par la
+                # fenêtre la plus fiable (ex. 09728320) : pas de doublon.
+                for ckey, cvalue in candidate.items():
+                    field[ckey] = cvalue
+                by_key[key] = field
+            else:
+                parsed.append(candidate)
+                by_key[key] = candidate
         return parsed
 
     @staticmethod
@@ -1068,15 +1050,14 @@ class LocalFormAnalyzer:
         """Recherche un Nom/Prénom illisible sur toute la page.
 
         Quand la valeur OCR d'un nom est un glyphe parasite (ex. ``"二"``)
-        ou absente, on balaie la page à la recherche du mot le plus proche
-        du lexique tunisien (prénom ou nom), en privilégiant les items
+        ou absente, on balaie la page à la recherche du mot qui se corrige
+        le mieux par décodage de caractères (structure vraisemblable)
+        sans jamais avoir recours à un lexique, en privilégiant les items
         proches du label du champ. L'entrée retenue est consommée.
         """
+        corrector = default_char_corrector()
         by_key = {field["key"]: field for field in parsed}
-        for key, lexicons in (
-            ("prenom", (TUNISIAN_FIRST_NAMES, TUNISIAN_LAST_NAMES)),
-            ("nom", (TUNISIAN_LAST_NAMES, TUNISIAN_FIRST_NAMES)),
-        ):
+        for key in ("prenom", "nom"):
             field = by_key.get(key)
             if field is None or field["value"]:
                 continue
@@ -1096,17 +1077,30 @@ class LocalFormAnalyzer:
                     continue
                 match: Optional[str] = None
                 for word in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']+", entry["text"]):
-                    for lexicon in lexicons:
-                        match = _closest_lexicon(word, lexicon)
-                        if match is not None:
+                    if word.isalpha() and len(word) >= 3:
+                        # Mot déjà structurellement sain : candidature de
+                        # dernière minute si rien de mieux ne se décodera.
+                        if word[0].isupper() and entry["confidence"] >= 0.95:
+                            match = word
                             break
-                    if match is not None:
-                        break
+                    else:
+                        # Lecture bruitée : une déconfusion de caractères
+                        # « répare » la structure (ex. 1→i) sans lexique.
+                        decoded = corrector.decode(word, "text")
+                        if (
+                            decoded.changed
+                            and decoded.confidence >= 0.9
+                            and len(decoded.value) >= 3
+                        ):
+                            match = decoded.value
+                            break
                 if match is None:
                     continue
-                distance = _levenshtein(_norm_key(word), _norm_key(match))
-                score = distance * 1000.0 + (
-                    self._rect_distance(label_rect, entry["rect"]) / 2000.0
+                changed = 1.0 if corrector.decode(word, "text").changed else 0.0
+                score = (
+                    changed * 100.0
+                    - entry["confidence"] * 10.0
+                    + self._rect_distance(label_rect, entry["rect"]) / 2000.0
                 )
                 if best is None or score < best[0]:
                     best = (score, index, match, entry)
@@ -1131,10 +1125,10 @@ class LocalFormAnalyzer:
     ) -> dict[str, Any]:
         """Construit l'entrée clé/valeur brute avant validation.
 
-        La valeur brute OCR est **corrigée** au préalable : confusions
-        chiffres/lettres pour les champs numériques, date de naissance
-        structurée (meilleure date plausible + lieu rapproché des villes
-        tunisiennes), noms/prénoms rapprochés du lexique tunisien.
+        La valeur brute OCR est **corrigée** au préalable : déconfusion
+        chiffres/lettres en fonction du type de champ (numérique vs texte),
+        date de naissance structurée (meilleure date plausible + lieu
+        déconfondu), noms/prénoms déconfondus au niveau des caractères.
         """
         if spec.key == "date_naissance":
             corrected = self._normalize_birth_value(value)
@@ -1142,10 +1136,19 @@ class LocalFormAnalyzer:
             corrected = self._correct_name_value(value)
         else:
             corrected = self._correct_ocr_value(spec.kind, value)
+        corrections: Optional[dict[str, Any]] = None
         if corrected != value:
-            # Correction fiable par lexique/déchiffrement : la lecture brute
+            # Correction fiable (déchiffrement) : la lecture brute
             # (faible confiance) est remplacée par une valeur canonique sûre.
             confidence = max(confidence, 0.92)
+            kind_lookup = {"nom": "text", "prenom": "text"}.get(
+                spec.key, spec.kind
+            )
+            corrections = {
+                "original": value,
+                "kind": kind_lookup,
+                "engine": "char",
+            }
         return {
             "key": spec.key,
             "label": spec.label,
@@ -1153,15 +1156,17 @@ class LocalFormAnalyzer:
             "confidence": confidence,
             "box": box,
             "section": spec.section,
+            "corrections": corrections,
         }
 
     def _normalize_birth_value(self, value: str) -> str:
-        """Date & lieu de naissance : meilleure date + ville tunisienne.
+        """Date & lieu de naissance : meilleure date + lieu déconfondu.
 
         La date la plus adéquate (JJ/MM/AAAA) est extraite du texte OCR
-        bruité ; le reste du texte est interprété comme le lieu et rapproché
-        de la ville tunisienne la plus proche (ex. ``"05.12.2003 Tnus"`` →
-        ``"05/12/2003 · Tunis"``).
+        bruité ; le reste du texte est interprété comme le lieu, nettoyé et
+        déconfondu au niveau des caractères (ex. ``"05.12.2003 Tnvs"`` →
+        ``"05/12/2003 · Tunis"`` sans recours à un lexique de villes : la
+        valeur reste lisible et n'est jamais inventée).
         """
         best = _best_date(value)
         date_str: Optional[str] = None
@@ -1187,44 +1192,38 @@ class LocalFormAnalyzer:
         raw_lieu = (value[:start] + value[end:]).strip()
         lieu = re.sub(r"\s+", " ", re.sub(r"^[\s,.;:·-]+|[\s,.;:·-]+$", "", raw_lieu))
         lieu = _clean_value(lieu).strip("·- ,.;:")
-        city = None
-        if lieu:
-            city = _closest_lexicon(lieu, TUNISIAN_CITIES)
-            if city is None:
-                for word in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']+", lieu):
-                    city = _closest_lexicon(word, TUNISIAN_CITIES)
-                    if city is not None:
-                        break
-        if city is not None:
-            lieu = city
+        if lieu and len(lieu) > 1:
+            # Déconfusion de caractères douce (jamais de rapprochement par
+            # dictionnaire) : un lieu inconnu reste une valeur valide.
+            lieu = _correct_char_level(lieu, "text")
+            # Ne garder que le dernier mot de structure propre (le lieu),
+            # les prépositions du texte OCR (« née le… à… ») sont écartées.
+            words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']+", lieu)
+            for word in reversed(words):
+                if len(word) >= 3 and not _is_noise_value(word):
+                    lieu = word[0].upper() + word[1:]
+                    break
         if not lieu or len(lieu) <= 1:
             return date_str
         return f"{date_str} · {lieu}"
 
-    @staticmethod
-    def _correct_name_value(value: str) -> str:
-        """Rapproche un nom/prénom de la liste tunisienne la plus proche.
+    def _correct_name_value(self, value: str) -> str:
+        """Déconfond un nom/prénom au niveau des caractères (aucun lexique).
 
-        Correction uniquement si l'écart (distance de Levenshtein) est <= 2 :
-        ``"D1d1"`` → ``"Didi"``. Une valeur inconnue reste inchangée (elle
-        sera signalée par la validation, jamais inventée).
+        ``"D1d1"`` → ``"Didi"`` par déconfusion structurelle (1→i), puis la
+        première lettre est mise en capitale. Une valeur dont la structure
+        reste douteuse (trop de chiffres résiduels) est inchangée : elle sera
+        signalée par la validation, jamais inventée.
         """
         if not value:
             return value
-        if any(ch.isdigit() for ch in value):
-            # Valeur avec chiffres : la comparaison porte sur le mot entier
-            # (« D1d1 » → « Didi »), jamais mot par mot (« Q1z9x » intact).
-            match = _closest_lexicon(value, TUNISIAN_FIRST_NAMES)
-            if match is None:
-                match = _closest_lexicon(value, TUNISIAN_LAST_NAMES)
-            return match if match is not None else value
-        corrected: list[str] = []
-        for word in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'-]+", value):
-            match = _closest_lexicon(word, TUNISIAN_FIRST_NAMES)
-            if match is None:
-                match = _closest_lexicon(word, TUNISIAN_LAST_NAMES)
-            corrected.append(match if match is not None else word)
-        return " ".join(corrected).strip().strip("'")
+        corrected = _correct_char_level(value, "text")
+        if not corrected:
+            return value
+        normalized = re.sub(r"\s+", " ", corrected).strip().strip(".'-")
+        if not normalized or len(normalized) < 2:
+            return value
+        return normalized[0].upper() + normalized[1:]
 
     @staticmethod
     def _correct_ocr_value(kind: str, value: str) -> str:
@@ -1239,12 +1238,15 @@ class LocalFormAnalyzer:
         les défigurer en ``"0M491097"``. Le CIN (8 chiffres) est reconstruit à
         partir de la séquence de chiffres la plus proche (espaces, ``O``→``0``,
         ``I``→``1``…). Les dates en toutes lettres (« Lundi 03 Juin 2024 »)
-        sont normalisées en JJ/MM/AAAA. Un établissement est rapproché de la
-        liste officielle des prépas tunisiennes (ex. ``"TLEIB"`` → ``"IPEIB"``).
+        sont normalisées en JJ/MM/AAAA. Un établissement est déconfondu au
+        niveau des caractères (ex. ``"TLE1B"`` → ``"TLEIB"``) — jamais par
+        rapprochement à une liste officielle.
         """
         if kind == "etablissement":
-            match = _closest_lexicon(value, _ETABLISSEMENTS_SET)
-            return match if match is not None else value
+            if not value:
+                return value
+            corrected = _normalize_keyword(value.replace(" ", "")).upper()
+            return corrected if corrected else value
         if kind == "date":
             date_span = _best_date(value)
             if date_span is not None:
@@ -1252,7 +1254,14 @@ class LocalFormAnalyzer:
             longhand = _french_date_value(value)
             return longhand if longhand is not None else value
         if kind == "cin":
-            nearest = _nearest_digit_window(value)
+            # Déconfusion chiffres/lettres au niveau des caractères (Viterbi)
+            # — plus efficace que la seule table statique pour un CIN taché
+            # (ex. ``O972832O`` → ``09728320``) — puis reconstruction de la
+            # fenêtre des 8 chiffres en privilégiant le 1er chiffre 0 ou 1
+            # (format tunisien).
+            decoded = _correct_char_level(value, "digit", strict=False)
+            probe = value if decoded == value else decoded
+            nearest = _nearest_digit_window(probe, 8, leading="01")
             if nearest is not None:
                 return nearest
         if kind not in _VALUE_KINDS or not value:
@@ -1262,7 +1271,7 @@ class LocalFormAnalyzer:
             return value
         corrected = value.translate(_OCR_CONFUSION_TABLE)
         if kind == "cin":
-            nearest = _nearest_digit_window(corrected)
+            nearest = _nearest_digit_window(corrected, 8, leading="01")
             if nearest is not None:
                 return nearest
         return corrected
@@ -1519,23 +1528,30 @@ class LocalFormAnalyzer:
             bounding_box=field.get("box") or None,
             section=field["section"],
             section_label=SECTION_LABELS[field["section"]],
+            corrections=field.get("corrections"),
         )
 
     # ------------------------------------------------------------------ #
     # Validateurs métier
     # ------------------------------------------------------------------ #
     def _validate_cin(self, value: str) -> tuple[bool, str]:
-        """CIN/passeport : numérique et exactement 8 chiffres."""
+        """CIN tunisien : 8 chiffres dont le premier est 0 ou 1."""
         cleaned = value.replace(" ", "")
         if CIN_RE.match(cleaned):
-            return True, ""
+            if cleaned[0] in ("0", "1"):
+                return True, ""
+            return (
+                False,
+                "Numéro CIN invalide : le premier chiffre doit être 0 ou 1 "
+                f"(lu: {cleaned}).",
+            )
         if any(ch.isalpha() for ch in cleaned):
             return (
                 False,
                 "Numéro CIN invalide : des lettres ont été lues "
-                "(ex. O972832O) — 8 chiffres attendus.",
+                "(ex. O972832O) — 8 chiffres attendus, premier 0 ou 1.",
             )
-        return False, "Format CIN invalide (8 chiffres attendus)."
+        return False, "Format CIN invalide (8 chiffres attendus, premier 0 ou 1)."
 
     def _validate_date(
         self,
@@ -1606,20 +1622,27 @@ class LocalFormAnalyzer:
 
     @staticmethod
     def _validate_etablissement(value: str) -> tuple[bool, str]:
-        """Établissement d'origine : liste officielle + distance de Levenshtein."""
+        """Établissement d'origine : acronyme en lettres latines (structure).
+
+        Aucune liste officielle n'est consultée : un acronyme lisible
+        (3–8 lettres) est accepté. Un établissement inconnu mais bien
+        orthographié reste **valide** — la structure seule est vérifiée.
+        """
         norm = re.sub(r"[^A-Z]", "", value.upper())
         if not norm:
             return True, ""
-        if norm in _ETABLISSEMENTS:
+        if any(ch.isdigit() for ch in value):
+            return (
+                False,
+                "Établissement suspect : chiffres résiduels après "
+                "déconfusion (ex. TLE1B au lieu de TLEIB).",
+            )
+        # Un acronyme lisible est accepté (structure), la valeur inconnue
+        # reste valide — aucun rapprochement à une liste officielle.
+        if re.fullmatch(r"[A-Z]{3,8}", norm):
             return True, ""
-        best = min(_levenshtein(norm, known) for known in _ETABLISSEMENTS)
-        if len(norm) >= 3 and best <= 2:
-            return True, ""
-        return (
-            False,
-            "Établissement suspect : ne correspond à aucun établissement "
-            "officiel (IPEIN, IPEIT, IPEIM, FGES…).",
-        )
+        # Minuscules/accents tolérés : la structure reste lisible.
+        return True, ""
 
     def _validate_anonyme(
         self,

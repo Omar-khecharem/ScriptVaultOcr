@@ -24,6 +24,7 @@ router = APIRouter(prefix="/api", tags=["health"])
 async def health(request: Request) -> HealthResponse:
     settings: Settings = request.app.state.settings
     engines: EngineManager = request.app.state.engines
+    corrector = getattr(request.app.state, "char_corrector", None)
     pool: dict[str, Any] = await engines.health()
     return HealthResponse(
         version=package_version,
@@ -35,7 +36,16 @@ async def health(request: Request) -> HealthResponse:
             if settings.cpu_threads > 0
             else min(8, os.cpu_count() or 4)
         ),
-        max_concurrency=settings.max_concurrency,
+        max_concurrency=settings.effective_max_concurrency,
         lang=settings.lang,
         uptime_s=float(pool["uptime_s"]),
+        corrections=(
+            {
+                "enabled": corrector is not None,
+                "engine": "char-level-viterbi",
+                "lexicon": False,
+            }
+            if corrector is not None
+            else {"enabled": False, "engine": "none", "lexicon": False}
+        ),
     )
