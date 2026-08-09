@@ -44,6 +44,7 @@ __all__ = [
     "match_field_label",
     "has_form_structure",
     "read_exam_form_zones",
+    "tight_ink_crop",
 ]
 
 logger = logging.getLogger("scriptvault.image_processing")
@@ -381,6 +382,26 @@ def crop_field_value(image: np.ndarray, band: FieldBand) -> np.ndarray:
     return crop
 
 
+def tight_ink_crop(crop: np.ndarray, *, pad: int = 12) -> np.ndarray:
+    """Recadre une zone sur son encre (bordures blanches retirées).
+
+    Les moteurs de transcription (TrOCR notamment) hallucinent sur les
+    zones larges quasi vides ; cette découpe ne garde que l'écriture
+    (pixels sombres) avec une marge de ``pad`` px.
+    """
+    if crop is None or crop.size == 0:
+        return crop
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    ys, xs = np.where(gray < 200)
+    if ys.size == 0:
+        return crop
+    y0 = max(0, int(ys.min()) - pad)
+    y1 = min(crop.shape[0], int(ys.max()) + pad + 1)
+    x0 = max(0, int(xs.min()) - pad)
+    x1 = min(crop.shape[1], int(xs.max()) + pad + 1)
+    return crop[y0:y1, x0:x1]
+
+
 # --------------------------------------------------------------------------- #
 # Libellés → clés de champ
 # --------------------------------------------------------------------------- #
@@ -540,6 +561,7 @@ def read_exam_form_zones(
     ] = None,
     digit_classifier: Optional[DigitClassifier] = None,
     max_side: int = _WORK_SIDE,
+    htr_recognize: Optional[Callable[[np.ndarray], tuple[str, float]]] = None,
 ) -> list[dict[str, Any]]:
     """Lit une feuille d'examen zone par zone (jamais la page entière).
 
@@ -550,6 +572,9 @@ def read_exam_form_zones(
             zones, ex. Paddle) — utilisée dans l'ordre si fournie.
         digit_classifier: classifieur MNIST (sinon auto + repli rec).
         max_side: plus grand côté de l'image de travail OpenCV.
+        htr_recognize: transcrit une zone manuscrite → ``(texte, confiance)``
+            (moteur TrOCR). Utilisé pour les champs manuscrits (nom/prénom)
+            où PP-OCR est faible.
 
     Returns:
         Items type ``[{"text", "confidence", "box", "label"}]`` — les clés
@@ -622,7 +647,7 @@ def read_exam_form_zones(
 
     items.extend(
         _transcribe_band_rows(
-            image, crop_pairs, recognize_crop, recognize_crops
+            image, crop_pairs, recognize_crop, recognize_crops, htr_recognize
         )
     )
 
@@ -643,6 +668,7 @@ def _transcribe_band_rows(
     recognize_crops: Optional[
         Callable[[list[np.ndarray]], list[list[dict[str, Any]]]]
     ],
+    htr_recognize: Optional[Callable[[np.ndarray], tuple[str, float]]] = None,
 ) -> list[dict[str, Any]]:
     """Transcrit les rangées en une seule passe réseau (image composite).
 
@@ -650,6 +676,10 @@ def _transcribe_band_rows(
     écart ; le réseau OCR (détection + reconnaissance) ne traite qu'UNE
     image. Les items sont ensuite redistribués à leur bande par position Y
     et les coordonnées sont remises à l'échelle du repère page.
+
+    Les champs manuscrits (Nom/Prénom) sont **retranscrits par le moteur
+    HTR** (TrOCR) si ``htr_recognize`` est fourni : PP-OCR lit mal les
+    lettres manuscrites.
 
     Repli : si la passe composite échoue (ex. modèle HTR saturé), les rangées
     sont transcrites individuellement (comportement historique).
@@ -706,7 +736,10 @@ def _transcribe_band_rows(
             text = str(entry.get("text", "")).strip()
             if not text:
                 continue
-            key = match_field_label(text) if ":" in text else None
+            if ":" in text or "：" in text:
+                key = match_field_label(text)
+            else:
+                key = None
             if key and key == "cin":
                 key = None  # le CIN vient de la grille de cases (MNIST)
             if key:
@@ -724,7 +757,10 @@ def _transcribe_band_rows(
             mapped = _map_back(results[0] if results else [])
         else:
             mapped = _map_back(recognize_crop(composite))
-        return _assign_labels(mapped)
+        mapped = _assign_labels(mapped)
+        if htr_recognize is not None:
+            mapped = _re_recognize_handwritten(image, pairs, mapped, htr_recognize)
+        return mapped
     except Exception:
         logger.warning("Passe composite échouée ; repli rangée par rangée.", exc_info=True)
 
@@ -744,7 +780,10 @@ def _transcribe_band_rows(
                 ]
             else:
                 entry["box"] = _value_box(band, width, height)
-            key = match_field_label(text) if ":" in text else None
+            if ":" in text or "：" in text:
+                key = match_field_label(text)
+            else:
+                key = None
             if key and key == "cin":
                 key = None
             if key:
@@ -767,6 +806,82 @@ def _stack_composite(rows: list[np.ndarray]) -> np.ndarray:
         canvas[y : y + row.shape[0], 0 : row.shape[1]] = row
         y += row.shape[0] + _COMPOSITE_GAP_Y
     return canvas
+
+
+#: Champs rédigés à la main (l'OCR PP-OCR y est faible → HTR TrOCR).
+_HTR_FIELDS = ("nom", "prenom")
+
+
+def _re_recognize_handwritten(
+    image: np.ndarray,
+    pairs: list[tuple[FieldBand, np.ndarray]],
+    items: list[dict[str, Any]],
+    htr_recognize: Callable[[np.ndarray], tuple[str, float]],
+) -> list[dict[str, Any]]:
+    """Retranscrit les champs manuscrits (Nom/Prénom) avec le moteur HTR.
+
+    Le réseau PP-OCR est excellent sur l'imprimé mais faible sur les lettres
+    manuscrites (ex. ``Nom : ... Ellmi`` → ``"Nom:.D"``). Pour chaque rangée
+    étiquetée ``nom``/``prenom``, la zone de valeur (à droite de la ligne
+    pointillée) est découpée puis transcrite par TrOCR. Si la lecture HTR est
+    fiable (≥ 2 lettres, confiance ≥ 0.5), elle remplace la lecture composite.
+    """
+    if not items or not pairs:
+        return items
+    by_key = {entry.get("label"): entry for entry in items}
+    changed: dict[str, tuple[str, float]] = {}
+    for label in _HTR_FIELDS:
+        entry = by_key.get(label)
+        if entry is None:
+            continue
+        box = entry.get("box")
+        if not box:
+            continue
+        band = _band_for_box(pairs, box)
+        if band is None:
+            continue
+        crop = crop_field_value(image, band)
+        if crop.size == 0:
+            continue
+        try:
+            text, conf = htr_recognize(crop)
+        except Exception:
+            logger.warning("Relecture HTR %s échouée.", label, exc_info=True)
+            continue
+        text = str(text or "").strip()
+        letters = sum(1 for ch in text if ch.isalpha())
+        if len(text) >= 2 and letters >= 2 and conf >= 0.5:
+            changed[label] = (text, conf)
+    if not changed:
+        return items
+    result: list[dict[str, Any]] = []
+    for entry in items:
+        label = entry.get("label")
+        if label in changed:
+            text, conf = changed[label]
+            replacement = dict(entry)
+            replacement["text"] = text
+            replacement["confidence"] = round(conf, 4)
+            result.append(replacement)
+        else:
+            result.append(entry)
+    return result
+
+
+def _band_for_box(
+    pairs: list[tuple[FieldBand, np.ndarray]], box: Any
+) -> Optional[FieldBand]:
+    """Bande la plus proche du centre Y d'une boîte (repère page)."""
+    if not box:
+        return None
+    cy = sum(pt[1] for pt in box) / 4.0
+    best: Optional[FieldBand] = None
+    best_dist = float("inf")
+    for band, _crop in pairs:
+        dist = abs(band.y_center - cy)
+        if dist < best_dist:
+            best, best_dist = band, dist
+    return best
 
 
 def _band_row_crop(image: np.ndarray, band: FieldBand) -> np.ndarray:

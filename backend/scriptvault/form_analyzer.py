@@ -42,6 +42,7 @@ from datetime import datetime
 from typing import Any, Optional, Sequence
 
 from scriptvault.char_corrector import default_char_corrector
+from scriptvault.etab_classes import closest_etab
 from scriptvault.schemas import (
     SECTION_LABELS,
     AnalyzedFormResponse,
@@ -228,6 +229,8 @@ def _is_noise_value(text: str) -> bool:
     prénom) : ces valeurs ne doivent jamais remplir un champ.
     """
     lowered = text.strip().lower()
+    if lowered.endswith((":", "：")):
+        return True  # rangée-libellé (ex. « No C.I.N … : ») : jamais une valeur
     if re.search(r"\bnombre\b|\bnumber\b|\bn?0?m8?re\b", lowered):
         return True
     # Glyphes CJK / coréens : jamais de valeur exploitable sur une copie
@@ -797,6 +800,17 @@ class LocalFormAnalyzer:
             if spec is None:
                 remainder.append(item)
                 continue
+            # Un item de zone porte souvent le libellé avec sa valeur
+            # ("Nom : ... Ellmi.") : le libellé est retiré avant analyse.
+            _, inline_value = self._split_inline_label(text)
+            if inline_value:
+                text = inline_value
+            elif self._match_label(_normalize_keyword(text)) is not None:
+                # « Libellé seul » (pas de séparateur ni de valeur lue,
+                # ex. "Etablissement d'origine ....") : pas un champ —
+                # la valeur sera cherchée spatialement plus loin.
+                remainder.append(item)
+                continue
             parsed.append(
                 self._build_field(
                     spec,
@@ -873,6 +887,10 @@ class LocalFormAnalyzer:
 
         # 3) Relecture ciblée des numéros manquants (CIN/série/identifiant).
         parsed = self._harvest_numeric_fields(entries, parsed, consumed)
+
+        # 3b) Correction Série/Identifiant via le bloc imprimé par le PC
+        #     (haut de page / bas à droite — le « 531531007 » du scan).
+        parsed = self._harvest_printed_codification(entries, parsed, consumed)
 
         # 4) Relecture ciblée des noms illisibles (prénom/nom) sur la page.
         parsed = self._harvest_name_fields(entries, parsed, consumed)
@@ -978,6 +996,69 @@ class LocalFormAnalyzer:
             return True
         digits = "".join(ch for ch in value if ch.isdigit())
         return len(digits) != expected
+
+    def _harvest_printed_codification(
+        self,
+        entries: list[dict[str, Any]],
+        parsed: list[dict[str, Any]],
+        consumed: set[int],
+    ) -> list[dict[str, Any]]:
+        """Corrige Série/Identifiant via le bloc imprimé par le PC.
+
+        Sur la feuille d'examen, le couple Série+Identifiant est aussi
+        **imprimé par le PC** (bandeau haut + bas à droite), sous la forme
+        d'une suite de 9 chiffres (ex. ``531531007`` = Série ``531`` +
+        Identifiant ``531007``) ou ``531 531007``. Les chiffres imprimés
+        sont fiables ; le premier chiffre de la grille manuscrite est le
+        plus souvent confondu par l'OCR. On privilégie donc la lecture
+        imprimée quand elle est cohérente (identifiant commençant par la
+        série).
+        """
+        by_key = {field["key"]: field for field in parsed}
+        serie = by_key.get("serie")
+        identifiant = by_key.get("identifiant")
+        if serie is None or identifiant is None:
+            return parsed
+        current_s = "".join(ch for ch in serie["value"] if ch.isdigit())
+        current_i = "".join(ch for ch in identifiant["value"] if ch.isdigit())
+        best: Optional[tuple[float, str, str]] = None
+        for index, entry in enumerate(entries):
+            if index in consumed:
+                continue
+            if self._match_label(entry["norm"]) is not None:
+                continue
+            m = re.search(r"(?:^|[^0-9])(\d{3})[\s./|-]*(\d{6})(?:[^0-9]|$)", entry["text"])
+            if m is None:
+                continue
+            s, i = m.group(1), m.group(2)
+            if not i.startswith(s):
+                continue  # identifiant incohérent avec la série : bruit
+            conf = float(entry.get("confidence", 0.0))
+            if best is None or conf > best[0]:
+                best = (conf, s, i)
+        if best is None or best[0] < 0.5:
+            return parsed
+        _conf, s, i = best
+        changed = False
+        if s != current_s:
+            serie["value"] = s
+            serie["confidence"] = max(serie["confidence"], 0.92)
+            serie["corrections"] = {
+                "original": current_s,
+                "kind": "digits",
+                "engine": "printed_block",
+            }
+            changed = True
+        if i != current_i:
+            identifiant["value"] = i
+            identifiant["confidence"] = max(identifiant["confidence"], 0.92)
+            identifiant["corrections"] = {
+                "original": current_i,
+                "kind": "digits",
+                "engine": "printed_block",
+            }
+            changed = True
+        return parsed if not changed else parsed
 
     @staticmethod
     def _find_label_index(
@@ -1238,15 +1319,31 @@ class LocalFormAnalyzer:
         les défigurer en ``"0M491097"``. Le CIN (8 chiffres) est reconstruit à
         partir de la séquence de chiffres la plus proche (espaces, ``O``→``0``,
         ``I``→``1``…). Les dates en toutes lettres (« Lundi 03 Juin 2024 »)
-        sont normalisées en JJ/MM/AAAA. Un établissement est déconfondu au
-        niveau des caractères (ex. ``"TLE1B"`` → ``"TLEIB"``) — jamais par
-        rapprochement à une liste officielle.
+        sont normalisées en JJ/MM/AAAA. Un établissement est compacté puis
+        rapproché de la liste officielle (``ETAB_CLASSES``) ; une valeur
+        inconnue mais propre reste telle quelle, les chiffres résiduels
+        (ex. ``TLE1B``) restent visibles pour la validation.
         """
         if kind == "etablissement":
             if not value:
                 return value
-            corrected = _normalize_keyword(value.replace(" ", "")).upper()
-            return corrected if corrected else value
+            # 1) Compactage (les chiffres sont conservés : un acronyme
+            #    résiduel « TLE1B » doit rester suspect pour la validation).
+            compact = _normalize_keyword(value).upper().replace(" ", "")
+            # 2) Nettoyage : enlever le libellé capturé par l'OCR
+            #    (« ETABLISSEMENT D ORIGINE ») s'il est collé à l'acronyme.
+            for label_prefix in ("ETABLISSEMENTDORIGINE", "ETABLISSEMENTSCOLAIRE", "ETABLISSEMENT", "INSTITUT", "LYCEE"):
+                if compact.startswith(label_prefix):
+                    compact = compact[len(label_prefix):]
+                    break
+            if len(compact) >= 2:
+                # 3) Rapprochement à la liste officielle (ratio de similarité) :
+                #    confusions de chiffres/lettres comprises (ex. « ENI7 » → ENIT).
+                match = closest_etab(compact)
+                if match is not None:
+                    return match
+                return compact if compact != value else value
+            return value
         if kind == "date":
             date_span = _best_date(value)
             if date_span is not None:
@@ -1294,9 +1391,11 @@ class LocalFormAnalyzer:
         text: str,
     ) -> tuple[Optional[FieldSpec], str]:
         """Extrait ``(champ, valeur)`` d'un item ``"Label : Valeur"``."""
-        if ":" not in text:
+        idxs = [i for i in (text.find(":"), text.find("：")) if i != -1]
+        if not idxs:
             return None, ""
-        label_part, _, value_part = text.partition(":")
+        idx = min(idxs)
+        label_part, value_part = text[:idx], text[idx + 1 :]
         spec = LocalFormAnalyzer._match_label(_normalize_keyword(label_part))
         if spec is None:
             return None, ""
@@ -1324,6 +1423,8 @@ class LocalFormAnalyzer:
                 continue  # un autre label n'est jamais une valeur
             if _is_noise_value(entry["text"]):
                 continue  # fragment de label (ex. « N0m8re de ») : jamais une valeur
+            if str(entry.get("raw", "")).strip().endswith((":", "：")):
+                continue  # rangée de libellé : jamais une valeur
             ex0, ey0, ex1, ey1 = entry["rect"]
             if ex0 < x1 - 2.0:
                 continue
@@ -1339,6 +1440,10 @@ class LocalFormAnalyzer:
             return self._pick_value_index(entries, same_line, label_index)
 
         # --- Passe 2 : en dessous (ligne suivante / cellule) ----------- #
+        spec = self._match_label(label["norm"])
+        max_dy = 80.0 if spec is not None and spec.key in ("nom", "prenom") else 300.0
+        # Un manuscrit « sous la ligne » est proche (dy ≤ 80) ; une valeur à
+        # 180 px+, pour un nom, est une autre rangée (ex. la ligne d'établissement).
         below: list[tuple[float, int]] = []
         for index, entry in enumerate(entries):
             if index == label_index or index in consumed:
@@ -1347,13 +1452,15 @@ class LocalFormAnalyzer:
                 continue
             if _is_noise_value(entry["text"]):
                 continue
+            if str(entry.get("raw", "")).strip().endswith((":", "：")):
+                continue  # rangée de libellé : jamais une valeur
             ex0, ey0, ex1, ey1 = entry["rect"]
             if ey0 <= y1:
                 continue
             if ex1 < x0 - label_height * 2.0 or ex0 > x1 + label_height * 2.0:
                 continue  # trop éloigné horizontalement du label
             dy = ey0 - y1
-            if dy > 300.0:
+            if dy > max_dy:
                 continue
             below.append((dy, index))
         if below:
@@ -1622,11 +1729,14 @@ class LocalFormAnalyzer:
 
     @staticmethod
     def _validate_etablissement(value: str) -> tuple[bool, str]:
-        """Établissement d'origine : acronyme en lettres latines (structure).
+        """Établissement d'origine : acronyme officiel (liste nationale).
 
-        Aucune liste officielle n'est consultée : un acronyme lisible
-        (3–8 lettres) est accepté. Un établissement inconnu mais bien
-        orthographié reste **valide** — la structure seule est vérifiée.
+        La lecture est rapprochée de la liste officielle des établissements
+        tunisiens (``ETAB_CLASSES``). Un acronyme connu est **valide** ; une
+        valeur proche d'un acronyme officiel (confusion OCR) est acceptée ;
+        une valeur inconnue mais structurellement propre reste valide (la
+        liste n'est pas exhaustive), seuls les chiffres résiduels ou les
+        valeurs illisibles sont rejetés.
         """
         norm = re.sub(r"[^A-Z]", "", value.upper())
         if not norm:
@@ -1637,9 +1747,8 @@ class LocalFormAnalyzer:
                 "Établissement suspect : chiffres résiduels après "
                 "déconfusion (ex. TLE1B au lieu de TLEIB).",
             )
-        # Un acronyme lisible est accepté (structure), la valeur inconnue
-        # reste valide — aucun rapprochement à une liste officielle.
-        if re.fullmatch(r"[A-Z]{3,8}", norm):
+        # Acronyme officiel reconnu (rapprochement flou) ou structure propre.
+        if closest_etab(norm) is not None or re.fullmatch(r"[A-Z]{3,8}", norm):
             return True, ""
         # Minuscules/accents tolérés : la structure reste lisible.
         return True, ""

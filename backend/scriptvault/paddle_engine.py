@@ -30,7 +30,9 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
 import cv2
@@ -178,6 +180,8 @@ class PaddleOCREngine:
         self._ocr: Any = None
         self._backend_name = ENGINE_BACKEND_NAME
         self.cpu_threads = cpu_threads if cpu_threads > 0 else (os.cpu_count() or 4)
+        self._htr: Any = None
+        self._htr_lock = threading.Lock()
         self.warm_up()
 
     # ------------------------------------------------------------------ #
@@ -295,6 +299,48 @@ class PaddleOCREngine:
             return []
         return _items_from_page(result[0])
 
+    # ------------------------------------------------------------------ #
+    # HTR (TrOCR) pour les champs manuscrits — paresseux
+    # ------------------------------------------------------------------ #
+    def _htr_recognize(self, crop: np.ndarray) -> tuple[str, float]:
+        """Transcrit une zone manuscrite avec TrOCR (``(texte, confiance)``).
+
+        Les modèles TrOCR ONNX vivent dans ``models/trocr/`` (via
+        ``python -m scriptvault.download_trocr_models``). Chargés une seule
+        fois (paresseux, verrouillé) ; session ONNX thread-safe. Si les
+        modèles sont absents, retourne ``("", 0.0)`` — le pipeline conserve
+        la lecture PP-OCR.
+        """
+        if crop is None or crop.size == 0:
+            return "", 0.0
+        if os.environ.get("SCRIPTVAULT_HTR", "0") not in ("1", "true", "yes", "on"):
+            return "", 0.0  # TrOCR non finetuné : lecture inexploitable
+        htr = self._htr
+        if htr is None:
+            with self._htr_lock:
+                htr = self._htr
+                if htr is None:
+                    from .htr_engine import load_htr
+
+                    root = os.path.dirname(os.path.abspath(__file__))
+                    htr_dir = os.path.abspath(
+                        os.path.join(root, "..", "..", "models", "trocr")
+                    )
+                    htr = load_htr(Path(htr_dir), threads=max(1, self.cpu_threads // 4))
+                    self._htr = htr
+        if htr is None:
+            return "", 0.0
+        try:
+            from .image_processing import tight_ink_crop
+
+            tight = tight_ink_crop(crop)
+            if tight is None or tight.size == 0:
+                return "", 0.0
+            return htr.recognize(tight)
+        except Exception as exc:
+            self.logger.warning("Relecture HTR échouée: %s", exc)
+            return "", 0.0
+
     @_as_ocr_error
     def _recognize_crops(
         self, crops: list[np.ndarray]
@@ -381,6 +427,7 @@ class PaddleOCREngine:
                 image,
                 self._recognize_crop,
                 recognize_crops=self._recognize_crops,
+                htr_recognize=self._htr_recognize,
             )
         if preprocess:
             image, _ = self._preprocessor.resize_for_ocr(
@@ -486,6 +533,7 @@ class PaddleOCREngine:
                 page,
                 self._recognize_crop,
                 recognize_crops=self._recognize_crops,
+                htr_recognize=self._htr_recognize,
             )
             image = page
         else:
