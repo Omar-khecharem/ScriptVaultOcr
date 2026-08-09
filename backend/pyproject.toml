@@ -5,16 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scriptvault"
 version = "2.0.0"
-description = "ScriptVault OCR — moteur local (PaddleOCR CPU) et API FastAPI partagés avec le desktop."
+description = "ScriptVault OCR — moteur HTR local (TrOCR ONNX CPU) et API FastAPI partagés avec le desktop."
 readme = { text = "ScriptVault OCR backend package (see repository README).", content-type = "text/markdown" }
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 dependencies = [
-    # Moteur OCR (CPU)
-    "paddlepaddle==3.3.1",
-    "paddleocr==3.7.0",
+    # Moteur OCR HTR (CPU)
+    "onnxruntime>=1.20,<1.28",
     "opencv-contrib-python==4.10.0.84",
     "numpy==2.3.5",
+    "Pillow>=10,<13",
     # API serveur
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.30,<1",

@@ -8,11 +8,10 @@
 
 -e .                                  # package local (moteur + API)
 
-# --- Moteur OCR local (PaddleOCR CPU) ---------------------------------------
-paddlepaddle==3.3.1                   # CPU x64/arm64 — wheels cp313 vérifiés
-paddleocr==3.7.0                      # Détection + reconnaissance + orientation
-opencv-contrib-python==4.10.0.84      # Exigé exactement par paddleocr 3.7
-numpy==2.3.5                          # Compatible Paddle 3.x / OpenCV 4.14
+# --- Moteur OCR local HTR (TrOCR ONNX Runtime) -------------------------------
+onnxruntime>=1.20,<1.28      # ORT CPU — greedy decoding TrOCR (thread-safe)
+opencv-contrib-python==4.10.0.84      # cv2.barcode + pipeline (>= 4.8 requis)
+numpy==2.3.5                          # Arrays — compatible OpenCV 4.x
 
 # --- API serveur ------------------------------------------------------------
 fastapi>=0.115,<1                     # Framework REST asynchrone

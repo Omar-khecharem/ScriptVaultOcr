@@ -93,6 +93,8 @@ def test_health(client: TestClient):
     assert data["lang"] == "en"
     assert data["max_concurrency"] == 1
     assert data["preloading"] is False
+    assert data["corrections"]["enabled"] is True
+    assert data["corrections"]["lexicon"] is False
 
 
 # --------------------------------------------------------------------------- #

@@ -23,7 +23,7 @@ if _BACKEND_DIR not in sys.path:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Serveur OCR local ScriptVault (FastAPI + PaddleOCR CPU).",
+        description="Serveur OCR local ScriptVault (FastAPI + moteur HTR TrOCR ONNX CPU).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

@@ -14,6 +14,8 @@ Contrat:
   page *telle qu'analysée* (overlay aligné côté web).
 * ``POST /api/batches/{id}/cancel`` — annule proprement le lot.
 * ``DELETE /api/batches/{id}`` — supprime le lot (mémoire + zone de travail).
+* ``PATCH /api/batches/{id}/files/{file_id}/form`` — corrige manuellement les
+  valeurs d'un formulaire (les corrections sont reprises dans l'export Excel).
 * ``GET /api/batches/{id}/export.xlsx`` — export Excel de toutes les données.
 
 Le gestionnaire :class:`~scriptvault.batch_engine.BatchManager` est attaché
@@ -42,6 +44,7 @@ from ...excel_exporter import (
     ExcelPage,
     export_excel,
 )
+from ...schemas import FormOverrideRequest
 from .ocr import _read_upload
 
 router = APIRouter(prefix="/api/batches", tags=["batches"])
@@ -80,13 +83,19 @@ def _filter_files(files: list[Any], q: str) -> list[Any]:
     ]
 
 
-def _form_to_excel_fields(form: Any) -> list[ExcelField]:
-    """Extrait les zones clés/valeurs du formulaire post-analyse."""
+def _form_to_excel_fields(
+    form: Any, overrides: Optional[dict[str, str]] = None
+) -> list[ExcelField]:
+    """Extrait les zones clés/valeurs du formulaire post-analyse.
+
+    ``overrides`` — corrections manuelles de l'utilisateur (UI) : elles
+    remplacent les valeurs lues par l'OCR avant l'export Excel.
+    """
     if form is None or not getattr(form, "fields", None):
         return []
     output: list[ExcelField] = []
     for field in form.fields:
-        text = (field.value or "").strip()
+        text = (overrides or {}).get(field.key, "") or (field.value or "").strip()
         if not text:
             continue
         output.append(
@@ -107,12 +116,15 @@ def _build_excel(job: Any) -> bytes:
             continue
         pages = []
         for page in file.pages:
+            page_no = int(page.get("page", 0))
             pages.append(
                 ExcelPage(
-                    page=int(page.get("page", 0)),
+                    page=page_no,
                     text=str(page.get("text", "")),
                     confidence=float(file.confidence or 0.0),
-                    fields=_form_to_excel_fields(page.get("form")),
+                    fields=_form_to_excel_fields(
+                        page.get("form"), file.form_overrides.get(page_no)
+                    ),
                 )
             )
         documents.append(ExcelDocument(filename=file.file_name, pages=pages))
@@ -223,7 +235,45 @@ async def get_file_detail(
         raise HTTPException(status_code=404, detail="Fichier introuvable.")
     summary = file.to_summary()
     summary["pages"] = jsonable_encoder(file.pages)
+    summary["overrides"] = {
+        str(page): values for page, values in file.form_overrides.items()
+    }
     return summary
+
+
+@router.patch(
+    "/{job_id}/files/{file_id}/form",
+    summary="Corriger manuellement le formulaire d'une page",
+)
+async def update_form_overrides(
+    request: Request, job_id: str, file_id: str, payload: FormOverrideRequest
+) -> dict[str, Any]:
+    """Enregistre les valeurs corrigées par l'utilisateur (export Excel inclus)."""
+    _, _, _, batch = _state(request)
+    job = batch.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Lot introuvable.")
+    file = next((f for f in job.files if f.file_id == file_id), None)
+    if file is None:
+        raise HTTPException(status_code=404, detail="Fichier introuvable.")
+    if payload.page < 1 or payload.page > len(file.pages):
+        raise HTTPException(status_code=404, detail="Page introuvable.")
+
+    cleaned = {
+        key: (value or "").strip() for key, value in payload.values.items() if key
+    }
+    overrides = file.form_overrides.setdefault(payload.page, {})
+    for key, value in cleaned.items():
+        if value:
+            overrides[key] = value
+        else:
+            overrides.pop(key, None)
+    if not file.form_overrides.get(payload.page):
+        file.form_overrides.pop(payload.page, None)
+    return {
+        "page": payload.page,
+        "overrides": dict(file.form_overrides.get(payload.page, {})),
+    }
 
 
 @router.get(

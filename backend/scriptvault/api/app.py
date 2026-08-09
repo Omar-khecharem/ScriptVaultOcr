@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 
 from .. import __version__
 from ..batch_engine import BatchManager
+from ..char_corrector import load_default_corrector
 from ..config import Settings
 from ..core_ocr import ImagePreprocessor, OCRBaseError, OCRInitError
 from ..engines import EngineFactory, EngineManager
@@ -68,11 +69,16 @@ def create_app(
         await app.state.engines.start()
         app.state.batch = BatchManager(settings, preprocessor=app.state.preprocessor)
         await app.state.batch.init(app.state.engines)
+        # Correcteur de niveau caractère (char-level) : le modèle lourd
+        # (~50–80 Mo) déposé dans ``models/char_lm/`` est chargé ici, une
+        # seule fois, pour toute la durée de vie du processus.
+        app.state.char_corrector = load_default_corrector(settings.model_dir)
         logger.info(
-            "API démarrée — langue=%r, threads=%d, concurrency=%d.",
+            "API démarrée — langue=%r, threads=%d, concurrency=%d, "
+            "correcteur=char-level(embarqué).",
             settings.lang,
             settings.cpu_threads or 0,
-            settings.max_concurrency,
+            settings.effective_max_concurrency,
         )
         yield
         await app.state.batch.close()
@@ -82,7 +88,7 @@ def create_app(
         title="ScriptVault OCR API",
         version=__version__,
         description=(
-            "API locale de reconnaissance de texte (PaddleOCR PP-OCRv6, CPU). "
+            "API locale de reconnaissance de texte (HTR TrOCR ONNX, CPU). "
             "Aucune donnée ne quitte la machine."
         ),
         lifespan=lifespan,

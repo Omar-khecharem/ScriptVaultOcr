@@ -154,6 +154,24 @@ export async function cancelBatch(jobId) {
   return response.json();
 }
 
+/**
+ * Enregistre les valeurs du formulaire corrigées à la main (export Excel
+ * compris). `values` = {clé de champ → valeur} ; une valeur vide efface
+ * la correction.
+ */
+export async function saveFormOverrides(jobId, fileId, page, values) {
+  const response = await fetch(
+    `${API_BASE}/batches/${jobId}/files/${fileId}/form`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ page, values }),
+    }
+  );
+  if (!response.ok) throw new Error(await parseError(response));
+  return response.json();
+}
+
 /** Supprime un lot (mémoire + zone de travail serveur). */
 export async function deleteBatch(jobId) {
   const response = await fetch(`${API_BASE}/batches/${jobId}`, {

@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Calibrage SCRIPTVAULT_ROI</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1rem; background: #14161a; color: #e8e8e8; }
+  header { display: flex; gap: 0.8rem; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 1.05rem; margin: 0; }
+  select, button { padding: 0.3rem 0.7rem; cursor: pointer; }
+  #fieldSelect { min-width: 17rem; }
+  #wrap { display: flex; gap: 1rem; align-items: flex-start; margin-top: 0.75rem; }
+  #imgWrap { border: 1px solid #333; background: #1d2025; overflow: auto; max-height: 72vh; }
+  canvas { display: block; cursor: crosshair; image-rendering: auto; }
+  #info { font: 0.74rem/1.55 Consolas, monospace; color: #9fb4d0; white-space: pre; }
+  #out { width: 100%; height: 5rem; box-sizing: border-box; font: 0.74rem Consolas, monospace; }
+  .hint { color: #9aa; font-size: 0.8rem; max-width: 46rem; line-height: 1.45; }
+  .keys { color: #c8a86a; }
+  .row { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; margin: 0.5rem 0; }
+  .tiny { font-size: 0.72rem; color: #9aa; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Calibrage des zones d'examen → <span class="keys">SCRIPTVAULT_ROI</span></h1>
+  <div class="row">
+    <label for="fieldSelect">Champ :&nbsp;</label>
+    <select id="fieldSelect"></select>
+    <button id="btnZoomIn" title="Zoom +">+</button>
+    <button id="btnZoomOut" title="Zoom −">−</button>
+    <button id="btnZoomReset" title="Ajuster à l'écran">Ajuster</button>
+    <button id="btnClear" title="Effacer la zone du champ courant">Effacer le champ</button>
+    <button id="btnEmpty" title="Tout effacer">Tout effacer</button>
+  </div>
+</header>
+
+<div id="wrap">
+  <div id="imgWrap">
+    <canvas id="cv"></canvas>
+  </div>
+  <div id="info"></div>
+</div>
+
+<p class="hint">
+  <b>1.</b> Sélectionnez un champ dans la liste, puis <b>cliquez-glissez</b> sur le scan pour tracer le
+  rectangle de la zone d'écriture (allez au centre du ceilulier, pas sur les étiquettes imprimées).
+  <b>2.</b> Molette = zoom sur le pointeur ; bouton du milieu (molette) enfoncé ou <b>Espace</b> maintenu + clic-droit
+  = pan. <b>3.</b> Répétez pour chaque champ. <b>4.</b> Cliquez <b>Copier le JSON</b> et placez le résultat
+  dans la variable d'environnement <span class="keys">SCCRIPTVAULT_ROI</span> (JSON, fractions normalisées
+  <span class="keys">[x0, y0, x1, y1]</span> de la page).
+</p>
+
+<div class="row">
+  <button id="btnCopy">Copier le JSON</button>
+  <input id="loadInput" placeholder="ou collez un JSON puis cliquez « Appliquer »" style="flex:1; min-width:18rem; padding:0.25rem">
+  <button id="btnApply">Appliquer</button>
+</div>
+<div id="out" readonly></div>
+
+<script>
+(function () {
+  "use strict";
+  const PRESET = [
+    ["concours", "Concours"],
+    ["epreuve", "Épreuve de"],
+    ["date_concours", "Date"],
+    ["duree", "Durée"],
+    ["nom", "Nom"],
+    ["prenom", "Prénom"],
+    ["date_naissance", "Date & lieu de naissance"],
+    ["etablissement", "Établissement d\"origine"],
+    ["cin", "N° C.I.N / passeport"],
+    ["serie", "Série"],
+    ["identifiant", "Identifiant"],
+  ];
+  const EXTRA = [
+    ["session", "Session (optionnel)"],
+    ["nombre_cahiers", "Nb de cahiers (optionnel)"],
+    ["zone_signature", "Zone signature (optionnel)"],
+  ];
+  const KEYS = PRESET.concat(EXTRA);
+  const box = {};
+  KEYS.forEach(([k]) => (box[k] = null));
+
+  const canvas = document.getElementById("cv");
+  const ctx = canvas.getContext("2d");
+  const select = document.getElementById("fieldSelect");
+  const info = document.getElementById("info");
+  const out = document.getElementById("out");
+
+  KEYS.forEach(([key, label], i) => {
+    const opt = document.createElement("option");
+    opt.value = key;
+    opt.textContent = label;
+    opt.selected = i === 0;
+    select.appendChild(opt);
+  });
+
+  const IMG_B64 = "PAYLOAD_B64";
+  const img = new Image();
+  let imgW = 0, imgH = 0;
+  const T = { s: 1, ox: 0, oy: 0 }; // transformation image → canvas (px)
+
+  img.onload = function () {
+    imgW = img.naturalWidth;
+    imgH = img.naturalHeight;
+    canvas.width = imgW;
+    canvas.height = imgH;
+    fit();
+    draw();
+  };
+  if (IMG_B64 && IMG_B64 !== "PAYLOAD_B64") img.src = "data:image/jpeg;base64," + IMG_B64;
+
+  function fit() {
+    const avW = Math.max(document.getElementById("imgWrap").clientWidth, 140) * 0.98;
+    const avH = window.innerHeight * 0.62;
+    const s = Math.min(avW / imgW, avH / imgH) || 1;
+    canvas.style.width = (imgW * s) + "px"; // canvas affiché en px ; précision au zoom
+    T.s = s;
+    T.ox = 0;
+    T.oy = 0;
+  }
+
+  function reset(s) {
+    T.s = s;
+    // ancrer au centre de la zone visible
+    const rect = canvas.getBoundingClientRect();
+    const vw = canvas.width, vh = canvas.height;
+    T.ox = rect.width / 2 - (vw / 2) * T.s;
+    T.oy = rect.height / 2 - (vh / 2) * T.s;
+  }
+  function zoomAt(mx, my, factor) {
+    const rect = canvas.getBoundingClientRect();
+    const px = mx - rect.left, py = my - rect.top;
+    const ix = (px - T.ox) / T.s, iy = (py - T.oy) / T.s;
+    T.s = Math.min(6, Math.max(0.02, T.s * factor));
+    T.ox = px - ix * T.s;
+    T.oy = py - iy * T.s;
+    applyTransform();
+    draw();
+  }
+  function applyTransform() {
+    canvas.style.width = (canvas.width * T.s) + "px";
+    canvas.style.height = (canvas.height * T.s) + "px";
+  }
+
+  function draw() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (imgW) {
+      ctx.setTransform(T.s, 0, 0, T.s, T.ox, T.oy);
+      ctx.drawImage(img, 0, 0, imgW, imgH);
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    KEYS.forEach(([key]) => {
+      const r = box[key];
+      if (!r) return;
+      const x = r.x0 * imgW * T.s + T.ox;
+      const y = r.y0 * imgH * T.s + T.oy;
+      const w = (r.x1 - r.x0) * imgW * T.s;
+      const h = (r.y1 - r.y0) * imgH * T.s;
+      ctx.strokeStyle = "#16a34a";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x, y, w, h);
+      ctx.fillStyle = "rgba(22,163,74,0.14)";
+      ctx.fillRect(x, y, w, h);
+    });
+    renderInfo();
+  }
+
+  function renderInfo() {
+    const defined = KEYS.filter(([k]) => box[k]);
+    let lines = [];
+    KEYS.forEach(([key, label]) => {
+      const r = box[key];
+      lines.push(r
+        ? `  ${label.padEnd(28)} x0=${r.x0.toFixed(4)}  y0=${r.y0.toFixed(4)}  x1=${r.x1.toFixed(4)}  y1=${r.y1.toFixed(4)}`
+        : `  ${label.padEnd(28)} — non défini`);
+    });
+    info.textContent = "Champs définis : " + defined.length + "/" + KEYS.length + "\n" + lines.join("\n");
+  }
+
+  let active = select.value, dragging = false, panning = false;
+  let startX = 0, startY = 0, lastPX = 0, lastPY = 0;
+
+  function toImg(e) {
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left, py = e.clientY - rect.top;
+    return { x: (px - T.ox) / T.s / imgW, y: (py - T.oy) / T.s / imgH };
+  }
+
+  canvas.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    if (e.button === 1) { panning = true; lastPX = e.clientX; lastPY = e.clientY; return; }
+    if (e.button === 2) { panning = true; lastPX = e.clientX; lastPY = e.clientY; return; }
+    if (e.button !== 0) return;
+    active = select.value;
+    const p = toImg(e);
+    startX = p.x; startY = p.y;
+    box[active] = { x0: Math.max(0, startX), y0: Math.max(0, startY), x1: Math.max(0, startX), y1: Math.max(0, startY) };
+    dragging = true;
+    draw();
+  });
+  canvas.addEventListener("mousemove", (e) => {
+    if (panning) {
+      T.ox += e.clientX - lastPX;
+      T.oy += e.clientY - lastPY;
+      lastPX = e.clientX; lastPY = e.clientY;
+      applyTransform();
+      draw();
+      return;
+    }
+    if (!dragging || !active) return;
+    const p = toImg(e);
+    box[active].x1 = Math.max(0, Math.min(1, p.x));
+    box[active].y1 = Math.max(0, Math.min(1, p.y));
+    draw();
+  });
+  window.addEventListener("mouseup", () => {
+    if (dragging && active) {
+      const r = box[active];
+      if (r && Math.abs(r.x1 - r.x0) < 0.0008) box[active] = null;
+      dragging = false; draw();
+    }
+    panning = false;
+  });
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+  }, { passive: false });
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  document.getElementById("btnZoomIn").onclick = () => zoomAt(canvas.width / 2, canvas.height / 2, 1.3);
+  document.getElementById("btnZoomOut").onclick = () => zoomAt(canvas.width / 2, canvas.height / 2, 1 / 1.3);
+  document.getElementById("btnZoomReset").onclick = () => { fit(); draw(); };
+  document.getElementById("btnClear").onclick = () => { if (active && box[active]) { box[active] = null; draw(); } };
+  document.getElementById("btnEmpty").onclick = () => { KEYS.forEach(([k]) => (box[k] = null)); draw(); };
+
+  function json() {
+    const o = {};
+    KEYS.forEach(([key]) => {
+      const r = box[key];
+      if (r) o[key] = [+r.x0.toFixed(4), +r.y0.toFixed(4), +r.x1.toFixed(4), +r.y1.toFixed(4)];
+    });
+    return JSON.stringify(o);
+  }
+  document.getElementById("btnCopy").onclick = () => {
+    const text = json();
+    out.textContent = text;
+    navigator.clipboard?.writeText(text).catch(() => {});
+    info.textContent += "\n\nJSON copié ✓\n" + text;
+  };
+  document.getElementById("btnApply").onclick = () => {
+    try {
+      const parsed = JSON.parse(document.getElementById("loadInput").value);
+      KEYS.forEach(([k]) => {
+        const v = parsed[k];
+        if (Array.isArray(v) && v.length === 4) box[k] = { x0: v[0], y0: v[1], x1: v[2], y1: v[3] };
+      });
+      draw();
+    } catch (err) {
+      info.textContent += "\nJSON invalide : " + err.message;
+    }
+  };
+  window.addEventListener("resize", () => { fit(); draw(); });
+})();
+</script>
+</body>
+</html>
