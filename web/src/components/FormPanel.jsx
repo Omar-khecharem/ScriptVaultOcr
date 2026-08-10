@@ -21,60 +21,96 @@ const SECTION_ORDER = ["concours", "candidat", "codification"];
 
 const DEBOUNCE_MS = 700;
 
-export default function FormPanel({ form, jobId, fileId, pageNumber }) {
+export default function FormPanel({ form, jobId, fileId, pageNumber, overrides, onSaved }) {
   const { fields } = form && Array.isArray(form.fields) ? form : { fields: [] };
   const [values, setValues] = useState({});
   const [dirty, setDirty] = useState(false);
   const [saved, setSaved] = useState(false);
 
-  // Réinitialise la saisie quand on change de fichier ou de page.
-  const snapshotKey = `${jobId}/${fileId}/${pageNumber}`;
-  useEffect(() => {
-    const next = {};
-    for (const field of fields) {
-      next[field.key] = field.value ?? "";
-    }
-    setValues(next);
-    setDirty(false);
-    setSaved(false);
-    editedKeys.current.clear();
-  }, [snapshotKey, fields.length]);
-
+  // Reflets synchrones de l'état : indispensables pour ne jamais perdre une
+  // correction si l'utilisateur change de fichier/page pendant le débounce.
+  const valuesRef = useRef(values);
+  const dirtyRef = useRef(false);
   const timerRef = useRef(null);
-  const flush = useCallback(() => {
+  const snapshotRef = useRef("");
+  const editedKeys = useRef(new Set());
+  valuesRef.current = values;
+
+  const persist = useCallback(
+    async (vals) => {
+      if (!jobId || !fileId) return;
+      const payload = {};
+      for (const [key, value] of Object.entries(vals)) {
+        if (value !== "") payload[key] = value;
+      }
+      await saveFormOverrides(jobId, fileId, pageNumber, payload);
+      setSaved(true);
+      onSaved?.();
+    },
+    [jobId, fileId, pageNumber, onSaved]
+  );
+
+  // Sauvegarde immédiate des corrections en attente (fin de débounce ou
+  // changement de fichier/page : le timeout ne doit jamais avaler la saisie).
+  const flushPending = useCallback(() => {
     if (timerRef.current) {
       clearTimeout(timerRef.current);
       timerRef.current = null;
     }
-  }, []);
+    if (dirtyRef.current && jobId && fileId) {
+      const pending = { ...valuesRef.current };
+      dirtyRef.current = false;
+      persist(pending).catch(() => setSaved(false));
+    }
+  }, [jobId, fileId, persist]);
+
+  // Réinitialise la saisie quand on change de fichier ou de page.
+  const snapshotKey = `${jobId}/${fileId}/${pageNumber}`;
+  useEffect(() => {
+    if (snapshotRef.current !== snapshotKey) {
+      snapshotRef.current = snapshotKey;
+      flushPending();
+    }
+    const next = {};
+    for (const field of fields) {
+      next[field.key] = field.value ?? "";
+    }
+    // Les corrections déjà enregistrées côté serveur réapparaissent.
+    for (const [key, value] of Object.entries(overrides || {})) {
+      if (value) next[key] = value;
+    }
+    setValues(next);
+    setDirty(false);
+    dirtyRef.current = false;
+    setSaved(false);
+    editedKeys.current = new Set(Object.keys(overrides || {}));
+  }, [snapshotKey, fields.length]);
 
   // Sauvegarde différée des corrections (déclenchée sur chaque modification).
   useEffect(() => {
     if (!dirty || !jobId || !fileId) return undefined;
     setSaved(false);
-    timerRef.current = setTimeout(async () => {
-      try {
-        const payload = {};
-        for (const [key, value] of Object.entries(values)) {
-          if (value !== "") payload[key] = value;
-        }
-        await saveFormOverrides(jobId, fileId, pageNumber, payload);
-        setSaved(true);
-      } catch {
-        setSaved(false);
-      }
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+    }
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null;
+      persist(values).catch(() => setSaved(false));
     }, DEBOUNCE_MS);
-    return flush;
-  }, [values, dirty, jobId, fileId, pageNumber]);
-
-  useEffect(() => flush, [snapshotKey]);
+    return () => {
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [values, dirty, jobId, fileId, pageNumber, persist]);
 
   const handleChange = useCallback((key, value) => {
     setValues((prev) => ({ ...prev, [key]: value }));
     setDirty(true);
+    dirtyRef.current = true;
   }, []);
 
-  const editedKeys = useRef(new Set());
   const markEdited = useCallback((key) => {
     editedKeys.current.add(key);
   }, []);

@@ -93,11 +93,14 @@ def _form_to_excel_fields(
     """
     if form is None or not getattr(form, "fields", None):
         return []
+    overrides = overrides or {}
     output: list[ExcelField] = []
+    seen: set[str] = set()
     for field in form.fields:
-        text = (overrides or {}).get(field.key, "") or (field.value or "").strip()
+        text = overrides.get(field.key, "") or (field.value or "").strip()
         if not text:
             continue
+        seen.add(field.key)
         output.append(
             ExcelField(
                 text=text,
@@ -105,6 +108,10 @@ def _form_to_excel_fields(
                 label=str(field.key),
             )
         )
+    for key, text in overrides.items():
+        if key in seen or not (text or "").strip():
+            continue
+        output.append(ExcelField(text=text, confidence=1.0, label=str(key)))
     return output
 
 
@@ -234,9 +241,26 @@ async def get_file_detail(
     if file is None:
         raise HTTPException(status_code=404, detail="Fichier introuvable.")
     summary = file.to_summary()
-    summary["pages"] = jsonable_encoder(file.pages)
+    pages = jsonable_encoder(file.pages)
+    overrides = file.form_overrides
+    for page in pages:
+        page_no = int(page.get("page", 0))
+        page_overrides = overrides.get(page_no)
+        if not page_overrides:
+            continue
+        form = page.get("form")
+        if not isinstance(form, dict) or not isinstance(form.get("fields"), list):
+            continue
+        for field in form["fields"]:
+            key = field.get("key")
+            if key in page_overrides:
+                field["value"] = page_overrides[key]
+                field["status"] = "valid"
+                field["error_message"] = None
+                field["edited"] = True
+    summary["pages"] = pages
     summary["overrides"] = {
-        str(page): values for page, values in file.form_overrides.items()
+        str(page): values for page, values in overrides.items()
     }
     return summary
 

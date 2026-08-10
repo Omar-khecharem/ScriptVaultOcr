@@ -57,7 +57,7 @@ function downloadBlob(blob, fallbackName) {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
-/** État du serveur et du pool de moteurs. */
+/** Habitat du serveur et du pool d'engines. */
 export async function getHealth() {
   const response = await fetch(`${API_BASE}/health`);
   if (!response.ok) throw new Error(await parseError(response));

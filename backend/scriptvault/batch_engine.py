@@ -288,6 +288,8 @@ class BatchJob:
             if confidences
             else 0.0,
             "elapsed_ms": elapsed_ms,
+            "created_at": round(started, 2),
+            "finished_at": round(self.finished_at, 2) if self.finished_at else None,
         }
 
     def __repr__(self) -> str:  # pragma: no cover - outil de debug
@@ -344,7 +346,6 @@ class BatchManager:
         )
         job_dir = storage_root / "jobs" / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
-        preview_dir = job_dir / "previews"
         for index, (filename, data) in enumerate(files, start=1):
             disk_path = job_dir / f"{index:05d}_{_sanitize_filename(filename)}"
             disk_path.write_bytes(data)
@@ -353,7 +354,7 @@ class BatchManager:
                     file_id=f"{job_id}-{index:05d}",
                     file_name=filename,
                     disk_path=disk_path,
-                    preview_dir=preview_dir,
+                    preview_dir=job_dir / "previews" / f"{index:05d}",
                 )
             )
         self._jobs[job_id] = job

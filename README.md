@@ -9,7 +9,7 @@
 [![License](https://img.shields.io/github/license/Omar-khecharem/omar-lab)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.13%20%7C%203.12%20%7C%203.11-blue)](https://www.python.org/downloads/)
 [![Code Style](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
-[![Version](https://img.shields.io/badge/version-2.1.0-8A2BE2.svg)](https://github.com/Omar-khecharem/omar-lab/releases)
+[![Version](https://img.shields.io/badge/version-2.2.0-8A2BE2.svg)](https://github.com/Omar-khecharem/omar-lab/releases)
 
 </div>
 
@@ -65,6 +65,10 @@ Le moteur d'inférence est **double** et interchangeable :
 - **Classification de risque** — chaque champ est `valid` / `warning` / `error` avec message explicite en français ; signature enseignante détectée par taux d'encre.
 - **Lecture par zones (grilles de chiffres)** — CIN, série, identifiant transcrits **grille par grille** via une seule passe de détection sur un composite, avec une précision quasi parfaite sur les chiffres.
 - **Traitement par lots** — ingestion massive (TIF multi-pages, PDF, images) en tâche de fond, progression en temps réel, annulation propre, aperçus à la demande, export **Excel** du lot.
+- **Corrections manuelles fiabilisées** — chaque correction du formulaire est enregistrée sans perte, même en basculant de fichier/page pendant l'enregistrement (flush immédiat) ; les valeurs corrigées sont ré-affichées au retour et reprises par l'export Excel.
+- **Formulaire affiché dès une seule image** — le détail d'un fichier sélectionné pendant son traitement se rafraîchit automatiquement en fin d'analyse : plus besoin d'une seconde image pour « forcer » l'affichage.
+- **Export Excel exhaustif** — toutes les colonnes du gabarit (Nom, Prénom, CIN, Identifiant, Série, Date & lieu de naissance, Établissement d'origine, Épreuve, Concours, Durée, Nombre de cahiers), avec correspondance insensible aux accents (la colonne « Prénom » ne reste plus jamais vide).
+- **Import moderne** — dialogue de création de lot (nom, dépôt multiple, langue, prétraitement, progression d'envoi) et style Windows Fluent rafraîchi.
 - **Exports** — TXT, DOCX, PDF, XLSX ; générés côté serveur.
 - **100 % local** — loopback par défaut, aucun egress réseau, compatible air-gap.
 - **Qualité garantie** — suite pytest, Ruff, Mypy et build Vite vérifiés par CI sur Linux et Windows.
@@ -232,7 +236,7 @@ scriptvault_ocr/
 │   └── src/
 │       ├── App.jsx                 #   orchestration (files, OCR, lots, export)
 │       ├── api/client.js           #   client HTTP (upload, analyzeForm)
-│       └── components/             #   DropZone · ImageCanvas · EditorPanel · FormPanel · Gauge
+│       └── components/             #   DropZone · ImageCanvas · EditorPanel · FormPanel · Gauge · ImportDialog · FileList
 ├── models/                         # Poids ONNX optionnels (gitignorés, hors-ligne ensuite)
 │   └── paddle_onnx/                #   PP-OCRv5_mobile_det.onnx + _rec.onnx + ppocr_dict.txt
 ├── tools/                          # Outils de calibration des ROI
@@ -379,6 +383,11 @@ règle métier violée).
    série/identifiant, durée, anonymat ;
 6. **Classification** — `valid` / `warning` / `error` avec message français
    explicite et confiance recalculée après correction.
+
+> Les **corrections manuelles** (UI) sont appliquées en dernier recours via
+> `form_overrides` — `PATCH /api/batches/{id}/files/{file_id}/form`. Elles
+> remplacent les valeurs lues (statut `valid`) dans le détail du fichier et
+> dans l'export Excel, y compris pour des champs non détectés par l'OCR.
 
 > La détection « zone de signature vide » est effectuée par ratio d'encre
 > sous l'étiquette (une signature manquante est signalée en rouge).

@@ -7,6 +7,7 @@ jusqu'à épuisement (le moteur factice est quasi instantané).
 
 from __future__ import annotations
 
+import io
 import time
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import cv2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from openpyxl import load_workbook
 from scriptvault.api.app import create_app
 from scriptvault.config import Settings
 
@@ -29,12 +31,12 @@ def _fake_engine_factory():
             assert isinstance(image, np.ndarray)
             return [
                 {
-                    "text": "Nom DUPONT",
+                    "text": "Nom : DUPONT",
                     "confidence": 0.99,
                     "box": [[0, 0], [50, 0], [50, 10], [0, 10]],
                 },
                 {
-                    "text": "Prénom Jean",
+                    "text": "Prénom : Jean",
                     "confidence": 0.85,
                     "box": [[0, 20], [40, 20], [40, 30], [0, 30]],
                 },
@@ -195,7 +197,40 @@ def test_preview_persisted_once_on_disk(client: TestClient, tmp_path: Path):
 
     previews_dir = tmp_path / "storage" / "jobs" / job["id"] / "previews"
     assert previews_dir.is_dir()
-    assert list(previews_dir.glob("*.jpg")), "l'aperçu doit être persisté sur disque"
+    assert (previews_dir / "00001" / "0001.jpg").is_file(), (
+        "l'aperçu doit être persisté sur disque (par fichier)"
+    )
+
+
+def test_previews_come_from_their_own_file(client: TestClient, tmp_path: Path):
+    """Chaque fichier renvoie SON aperçu : le dossier d'aperçus est isolé par
+    fichier (régression : auparavant tous les fichiers partageaient un dossier
+    commun et renvoyaient l'image du premier fichier du lot)."""
+    image_a = _sample_image(tmp_path, name="a.png")
+    image_b = _sample_image(tmp_path, name="b.png")
+    image_b.write_bytes(
+        cv2.imencode(
+            ".png",
+            np.hstack([np.full((300, 400, 3), 0, dtype=np.uint8), np.full((300, 400, 3), 255, dtype=np.uint8)]),
+        )[1].tobytes()
+    )
+    job = _create_batch(client, [image_a, image_b])["job"]
+    _wait_done(client, job["id"])
+
+    items = client.get(f"/api/batches/{job['id']}/files").json()["items"]
+    assert len(items) == 2
+    previews = [
+        client.get(f"/api/batches/{job['id']}/files/{item['id']}/preview")
+        .json()["preview"]
+        for item in items
+    ]
+    assert previews[0] != previews[1], "les aperçus des fichiers doivent différer"
+
+    previews_dir = tmp_path / "storage" / "jobs" / job["id"] / "previews"
+    first_jpeg = previews_dir / "00001" / "0001.jpg"
+    second_jpeg = previews_dir / "00002" / "0001.jpg"
+    assert first_jpeg.is_file() and second_jpeg.is_file()
+    assert first_jpeg.read_bytes() != second_jpeg.read_bytes()
 
 
 def test_batch_export_excel(client: TestClient, tmp_path: Path):
@@ -207,6 +242,40 @@ def test_batch_export_excel(client: TestClient, tmp_path: Path):
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/vnd.openxmlformats")
     assert response.content.startswith(b"PK")
+
+
+def test_excel_columns_are_filled_and_accent_safe(
+    client: TestClient, tmp_path: Path
+):
+    """Régression : la colonne « Prénom » (accent) doit être peuplée, de même
+    que les colonnes du gabarit (Série, Date de naissance, Établissement…),
+    y compris via une correction manuelle d'un champ non lu par l'OCR."""
+    image = _sample_image(tmp_path)
+    job = _create_batch(client, [image])["job"]
+    _wait_done(client, job["id"])
+    file_id = client.get(f"/api/batches/{job['id']}/files").json()["items"][0]["id"]
+
+    # L'OCR lit « Prénom Jean » : même sans correction, la colonne doit sortir.
+    response = client.get(f"/api/batches/{job['id']}/export.xlsx")
+    workbook = load_workbook(io.BytesIO(response.content))
+    sheet = workbook["Données Extraites"]
+    headers = [entry.value for entry in sheet[1]]
+    row = [entry.value for entry in sheet[2]]
+    assert row[headers.index("Prénom")] == "Jean"
+    assert row[headers.index("Nom")] == "DUPONT"
+
+    # Correction manuelle d'un champ absent de l'export (ex. la série) :
+    # la valeur corrigée doit apparaître dans sa colonne.
+    client.patch(
+        f"/api/batches/{job['id']}/files/{file_id}/form",
+        json={"page": 1, "values": {"serie": "042"}},
+    )
+    response = client.get(f"/api/batches/{job['id']}/export.xlsx")
+    workbook = load_workbook(io.BytesIO(response.content))
+    sheet = workbook["Données Extraites"]
+    headers = [entry.value for entry in sheet[1]]
+    row = [entry.value for entry in sheet[2]]
+    assert row[headers.index("Série")] == "042"
 
 
 def test_form_overrides_patch_and_excel(client: TestClient, tmp_path: Path):
@@ -236,6 +305,16 @@ def test_form_overrides_patch_and_excel(client: TestClient, tmp_path: Path):
 
     detail = client.get(f"/api/batches/{job['id']}/files/{file_id}").json()
     assert detail["overrides"]["1"]["nom"] == "DUPONT CORRIGE"
+
+    # Le détail refusé au client doit refléter la correction (statut valid).
+    nom = next(
+        field
+        for field in detail["pages"][0]["form"]["fields"]
+        if field["key"] == "nom"
+    )
+    assert nom["value"] == "DUPONT CORRIGE"
+    assert nom["status"] == "valid"
+    assert nom["edited"] is True
 
     # Une valeur vide efface la correction.
     response = client.patch(

@@ -49,6 +49,7 @@ Exemple::
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
@@ -122,12 +123,21 @@ COLUMNS = [
     "Prénom",
     "CIN",
     "Identifiant",
+    "Série",
+    "Date & Lieu de Naissance",
+    "Établissement d'origine",
+    "Épreuve",
+    "Concours",
+    "Date Concours",
+    "Durée",
+    "Nombre de Cahiers",
     "Indice de Confiance Global (%)",
     "Statut Validation",
     "Date Traitement",
 ]
 
-# Alias de libellés ROI → colonne canonique.
+# Alias de libellés ROI → colonne canonique (sans accents : la normalisation
+# de :func:`_norm_label` retire les accents avant la recherche).
 _LABEL_ALIASES = {
     "nom": "Nom",
     "name": "Nom",
@@ -139,7 +149,38 @@ _LABEL_ALIASES = {
     "id": "Identifiant",
     "identifier": "Identifiant",
     "no_dossier": "Identifiant",
+    "serie": "Série",
+    "date_naissance": "Date & Lieu de Naissance",
+    "lieu_naissance": "Date & Lieu de Naissance",
+    "naissance": "Date & Lieu de Naissance",
+    "etablissement": "Établissement d'origine",
+    "ecole": "Établissement d'origine",
+    "etab": "Établissement d'origine",
+    "epreuve": "Épreuve",
+    "concours": "Concours",
+    "date_concours": "Date Concours",
+    "duree": "Durée",
+    "nombre_cahiers": "Nombre de Cahiers",
+    "cahiers": "Nombre de Cahiers",
 }
+
+#: Colonnes de données clé/valeur (affichage texte, aligné à gauche).
+_DATA_COLUMNS = frozenset(
+    {
+        "Nom",
+        "Prénom",
+        "CIN",
+        "Identifiant",
+        "Série",
+        "Date & Lieu de Naissance",
+        "Établissement d'origine",
+        "Épreuve",
+        "Concours",
+        "Date Concours",
+        "Durée",
+        "Nombre de Cahiers",
+    }
+)
 
 _SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._ -]")
 
@@ -147,9 +188,19 @@ _SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._ -]")
 # --------------------------------------------------------------------------- #
 # Helpers de normalisation
 # --------------------------------------------------------------------------- #
+def _strip_accents(text: str) -> str:
+    """Retire les accents (NFD puis suppression des marques combinantes).
+
+    ``"Prénom"`` → ``"Prenom"`` : la correspondance des colonnes est ainsi
+    insensible aux accents, quel que soit le libellé source.
+    """
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+
+
 def _norm_label(label: str) -> Optional[str]:
     """Normalise un libellé ROI vers une colonne canonique (None si inconnu)."""
-    return _LABEL_ALIASES.get(label.strip().lower())
+    return _LABEL_ALIASES.get(_strip_accents(label.strip().lower()))
 
 
 def _field_text(fields: list[ExcelField], label: str) -> str:
@@ -344,6 +395,14 @@ def export_excel(
                     _field_text(fields, "Prénom"),
                     _field_text(fields, "CIN"),
                     _field_text(fields, "Identifiant"),
+                    _field_text(fields, "Série"),
+                    _field_text(fields, "Date & Lieu de Naissance"),
+                    _field_text(fields, "Établissement d'origine"),
+                    _field_text(fields, "Épreuve"),
+                    _field_text(fields, "Concours"),
+                    _field_text(fields, "Date Concours"),
+                    _field_text(fields, "Durée"),
+                    _field_text(fields, "Nombre de Cahiers"),
                     confidence,
                     status,
                     generated.strftime("%d/%m/%Y %H:%M"),
@@ -353,7 +412,7 @@ def export_excel(
                     name = COLUMNS[index]
                     if name == "Nom du Fichier":
                         rows.append(cell(ws_data, value, alignment=left_wrap))
-                    elif name in ("Nom", "Prénom", "CIN", "Identifiant"):
+                    elif name in _DATA_COLUMNS:
                         rows.append(cell(ws_data, value, alignment=left_wrap))
                     elif name == "Code-Barres / QR":
                         rows.append(cell(ws_data, value, alignment=center))
