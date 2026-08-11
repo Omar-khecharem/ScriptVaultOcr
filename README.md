@@ -6,10 +6,10 @@
 
 **Your documents never leave your machine.**
 
-[![License](https://img.shields.io/github/license/Omar-khecharem/omar-lab)](LICENSE)
+[![License](https://img.shields.io/github/license/Omar-khecharem/ScriptVaultOcr)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.13%20%7C%203.12%20%7C%203.11-blue)](https://www.python.org/downloads/)
 [![Code Style](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
-[![Version](https://img.shields.io/badge/version-2.2.0-8A2BE2.svg)](https://github.com/Omar-khecharem/omar-lab/releases)
+[![Version](https://img.shields.io/badge/version-2.3.0-8A2BE2.svg)](https://github.com/Omar-khecharem/ScriptVaultOcr/releases)
 
 </div>
 
@@ -20,9 +20,6 @@
 - [Vue d'ensemble](#vue-densemble)
 - [Fonctionnalités](#fonctionnalités)
 - [Étude de performance : état des lieux](#étude-de-performance--état-des-lieux)
-  - [Les 3 goulots d'étranglement identifiés](#les-3-goulots-détranglement-identifiés)
-  - [Benchmarks avant / après](#benchmarks-avant--après)
-  - [Ce qui reste lent aujourd'hui](#ce-qui-reste-lent-aujourdhui)
 - [Feuille de route d'optimisation](#feuille-de-route-doptimisation)
 - [Architecture](#architecture)
 - [Structure du dépôt](#structure-du-dépôt)
@@ -50,7 +47,16 @@ Le moteur d'inférence est **double** et interchangeable :
 |---|---|---|
 | `ppocrv5-onnx` | **PP-OCRv5 (det + rec) via ONNX Runtime** | **Défaut** — rapide, sans dépendance Paddle |
 | `paddle` | PP-OCRv5 via PaddlePaddle/PaddleX | Repli si les modèles ONNX sont absents |
-| (optionnel) | TrOCR-small-handwritten ONNX | Lecture de champs manuscrits (HTR) par zone |
+| (optionnel) | TrOCR-small-handwritten ONNX | Repli HTR pour champs manuscrits par zone |
+| (optionnel) | **VLM local `qwen2.5vl:7b` via Ollama** | **Lecture grille par grille des bandes manuscrites** (nom, prénom, naissance…) |
+
+> Depuis la **v2.3.0**, les champs manuscrits d'une feuille d'examen sont lus
+> par un **VLM (vision-language model) local** : les bandes numérotées sont
+> découpées en grilles (8 lignes par grille) et transcrites en une seule
+> inférence chacune. Les rangées incomplètes sont **relues en cascade**
+> (grille suivante, puis ligne isolée agrandie), ce qui élimine les champs
+> vides « non lus par l'OCR ». Aucune donnée ne quitte la machine : Ollama
+> tourne sur `127.0.0.1`.
 
 > Le backend ONNX a été introduit pour éliminer un problème majeur de
 > performance : **PaddlePaddle sans accélération oneDNN est ≈ 8× plus lent**
@@ -61,6 +67,8 @@ Le moteur d'inférence est **double** et interchangeable :
 ## Fonctionnalités
 
 - **Reconnaissance de texte** — PP-OCRv5 (détection + reconnaissance) via ONNX Runtime, ou PaddlePaddle en repli ; pré-traitement adaptatif (CLAHE, deskew, binarisation).
+- **Lecture VLM par grilles (manuscrit)** — `qwen2.5vl:7b` (Ollama, 100 % local) transcrit les bandes numérotées **grille par grille** (8 lignes par image, `num_ctx=8192`, `num_gpu=99`, `keep_alive=30 min`) ; modèle pré-chauffé au démarrage du serveur.
+- **Relecture ciblée anti-champs-vides** — les rangées incomplètes sont relues en cascade (grille suivante, puis ligne seule agrandie) ; les lignes « libellé seul » sont filtrées et les rangées manquantes récupérées.
 - **Analyse automatique de formulaire** — extraction clé/valeur par appariement spatial, déconfusion OCR (`A2/2oo3` → `2003`), correction via lexiques tunisiens (noms, prénoms, villes, établissements, matières) et règles métier (CIN, dates, série/identifiant).
 - **Classification de risque** — chaque champ est `valid` / `warning` / `error` avec message explicite en français ; signature enseignante détectée par taux d'encre.
 - **Lecture par zones (grilles de chiffres)** — CIN, série, identifiant transcrits **grille par grille** via une seule passe de détection sur un composite, avec une précision quasi parfaite sur les chiffres.
@@ -70,8 +78,8 @@ Le moteur d'inférence est **double** et interchangeable :
 - **Export Excel exhaustif** — toutes les colonnes du gabarit (Nom, Prénom, CIN, Identifiant, Série, Date & lieu de naissance, Établissement d'origine, Épreuve, Concours, Durée, Nombre de cahiers), avec correspondance insensible aux accents (la colonne « Prénom » ne reste plus jamais vide).
 - **Import moderne** — dialogue de création de lot (nom, dépôt multiple, langue, prétraitement, progression d'envoi) et style Windows Fluent rafraîchi.
 - **Exports** — TXT, DOCX, PDF, XLSX ; générés côté serveur.
-- **100 % local** — loopback par défaut, aucun egress réseau, compatible air-gap.
-- **Qualité garantie** — suite pytest, Ruff, Mypy et build Vite vérifiés par CI sur Linux et Windows.
+- **100 % local** — loopback par défaut, aucun egress réseau, compatible air-gap ; le VLM est servi par Ollama sur `127.0.0.1:11434`.
+- **Qualité garantie** — suite pytest (58 tests), Ruff, Mypy et build Vite vérifiés par CI sur Linux et Windows.
 
 ---
 
@@ -79,7 +87,7 @@ Le moteur d'inférence est **double** et interchangeable :
 
 > Benchmarks réalisés sur une feuille d'examen réelle `2504202513590500010015.tif`
 > (1 page, 3528×1356 paysage, ~24 bandes pointillées, 3 grilles de chiffres),
-> machine **Windows / Python 3.13 / CPU Intel 16 cœurs (AVX2)**.
+> machine **Windows / Python 3.13 / CPU Intel 16 cœurs (AVX2)**, GPU CUDA.
 
 ### Les 3 goulots d'étranglement identifiés
 
@@ -145,15 +153,31 @@ Champs imprimés lus correctement : « Etablissement d'origine », « Date &
 lieu de naissance », « Epreuve de : Physique », « Date : Lundi 03 Juin 2024 à
 8 H », « Durée : 4 Heures », « Concours : Physique & Chimie »…
 
+### VLM (v2.3.0) : lecture manuscrite par grilles
+
+| Scénario | Temps | Notes |
+|---|---|---|
+| **1 page (~24 bandes, 3 grilles)** | **~42 s à froid** | Chargement initial du modèle dans Ollama (GPU) |
+| **1 page (modèle déjà chargé)** | **~15 s** | `keep_alive=30m` maintient le modèle en VRAM |
+| 1 rangée reprise en relecture | ~1–3 s | Relecture ciblée ligne seule (agrandie) |
+| Zones chiffrées (CIN/Série/Identifiant) | inchangé | Toujours via composite ONNX, quasi parfait |
+
+- Le **timeout VLM est étendu au chargement à froid** : la première page du
+  lot paie le chargement, les suivantes exploitent le modèle chaud.
+- La **relecture en cascade** des rangées incomplètes supprime les champs
+  vides « non lus par l'OCR » ; les rangées sont numérotées et toute rangée
+  manquante est relue jusqu'à récupération.
+- Configuration : `SCRIPTVAULT_VLM_ENABLED`, `SCRIPTVAULT_VLM_URL`,
+  `SCRIPTVAULT_VLM_MODEL` (défaut `qwen2.5vl:7b`),
+  `SCRIPTVAULT_VLM_TIMEOUT_S`, `SCRIPTVAULT_VLM_MAX_TOKENS`,
+  `SCRIPTVAULT_VLM_TEMPERATURE` (défaut `0.0`).
+
 ### Ce qui reste lent aujourd'hui
 
-- **Lecture manuscrite (Nom / Prénom, Date & lieu de naissance)** — la
-  reconnaissance de texte imprimé est rapide, mais les zones manuscrites
-  passent encore par le chemin générique et produisent du bruit
-  (ex. `Nom : ... Ellmi`). C'est la **prochaine cible** (voir feuille de route).
 - **Latence d'échauffement** — le premier fichier d'un lot paie le chargement
-  des modèles ONNX (~3,5 s au premier appel) ; les moteurs sont ensuite
-  pré-chargés et réutilisés.
+  des modèles ONNX (~3,5 s) **et** du VLM dans Ollama (temps de première
+  grille) ; les deux sont ensuite pré-chargés et réutilisés (`warm_up` au
+  démarrage du serveur).
 - **Traitement par lots** — le séquentiel est meilleur que le parallèle
   aujourd'hui ; il reste à explorer le batching d'images au sein d'une même
   inférence (batch ONNX) plutôt que le parallélisme de processus.
@@ -169,7 +193,7 @@ Ordre d'impact estimé (du plus rentable au moins rentable) :
 | 1 | **Backend ONNX Runtime (PP-OCRv5 det+rec)** | ✅ **Livré** | ×4 sur 1 fichier, ×3,1 sur lot |
 | 2 | **Lecture zones en un seul composite** (1 passe) | ✅ **Livré** | ~4× vs lecture champ par champ |
 | 3 | **Concurrence bornée `SCRIPTVAULT_MAX_CONCURRENCY`** (défaut 1) | ✅ **Livré** | lot 18,2 s vs 22,9 s |
-| 4 | **HTR dédié pour champs manuscrits** (TrOCR quantisé par zone) | 🔄 En cours | précision Nom/Prénom/Naissance → ≥ 95 % |
+| 4 | **Lecture manuscrite par VLM local (qwen2.5vl) + relecture en cascade** | ✅ **Livré** | plus de champs vides ; ~15 s/page à chaud |
 | 5 | **Batching d'images dans l'inférence ONNX** (rec en batch de 32 lignes déjà en place) | 🔄 En cours | encore ×2–3 sur la reconnaissance |
 | 6 | **Quantification int8 des modèles ONNX** | 📋 Planifié | ~×1,5–2 sans perte majeure de précision |
 | 7 | **Détection uniquement sur bandes pertinentes** (éviter la page entière) | 📋 Planifié | réduit le coût de la détection sur grandes pages |
@@ -185,20 +209,23 @@ flowchart LR
     C --> D["scriptvault.onnx_ocr / paddle_engine<br/>PP-OCRv5 det+rec (ONNX Runtime, défaut)"]
     D --> E["Normalized Results<br/>{text · confidence · box}"]
     E --> F["scriptvault.form_analyzer<br/>Key/Value · déconfusion OCR · lexes · validation métier · <30 ms"]
-    F --> G["Web<br/>React + Vite"]
+    E --> G["Web<br/>React + Vite"]
     E --> H["scriptvault.batch_engine<br/>BatchManager asynchrone (lots, aperçus, Excel)"]
     H --> G
     E --> I["Exports<br/>TXT · DOCX · PDF · XLSX"]
     E --> J["scriptvault.image_processing<br/>Lecture zones composite (grilles CIN/Série/Identifiant)"]
+    C -.-> K["scriptvault.vlm_reader<br/>qwen2.5vl local (Ollama) — grilles de bandes manuscrites + relecture"]
+    K --> E
 ```
 
 | Module | Fichier | Rôle |
 |---|---|---|
-| OCR Engine | `backend/scriptvault/core_ocr.py` | Moteur partagé : prétraitement, détection, ROI, CLI |
+| OCR Engine | `backend/scriptvault/core_ocr.py` | Moteur partagé : prétraitement, détection, ROI, CLI, orchestration VLM |
 | **ONNX Backend** | `backend/scriptvault/onnx_ocr.py` | **PP-OCRv5 det+rec via ONNX Runtime** (shim compatible paddle) — recommandé |
 | Paddle Backend | `backend/scriptvault/paddle_engine.py` | Repli PaddlePaddle/PaddleX, composite rois, zones sur page brute |
-| HTR Engine | `backend/scriptvault/htr_engine.py` | TrOCR ONNX (manuscrit) |
-| Zones | `backend/scriptvault/image_processing.py` | Lecture par zones en une passe (composite) |
+| HTR Engine | `backend/scriptvault/htr_engine.py` | TrOCR ONNX (manuscrit) — repli si VLM indisponible |
+| **VLM Reader** | `backend/scriptvault/vlm_reader.py` | **Lecture grille par grille des bandes manuscrites** via Ollama (qwen2.5vl), prompts système, parsing JSON, warm-up |
+| Zones | `backend/scriptvault/image_processing.py` | Lecture par zones en une passe (composite) + grilles de bandes + relecture ciblée |
 | Engine Pool | `backend/scriptvault/engines.py` | Pool round-robin thread-safe (asyncio), pré-chargement |
 | PDF Rasterizer | `backend/scriptvault/pdf.py` | Rasterisation PDF → images (160 dpi) |
 | Form Analyzer | `backend/scriptvault/form_analyzer.py` | Post-OCR : extraction spatiale clé/valeur, corrections OCR, lexes, validation métier, < 30 ms |
@@ -220,9 +247,10 @@ scriptvault_ocr/
 │   │   ├── onnx_ocr.py             #   PP-OCRv5 det+rec ONNX Runtime (défaut)
 │   │   ├── paddle_engine.py        #   repli PaddlePaddle + lecture zones
 │   │   ├── htr_engine.py           #   TrOCR manuscrit (ONNX)
-│   │   ├── image_processing.py     #   zones composite (1 passe)
+│   │   ├── vlm_reader.py           #   VLM local qwen2.5vl (Ollama) : grilles + relecture
+│   │   ├── image_processing.py     #   zones composite (1 passe) + grilles de bandes
 │   │   ├── core_ocr.py             #   moteur partagé, prétraitement, CLI
-│   │   ├── engines.py              #   pool thread-safe asyncio
+│   │   ├── engines.py              #   pool thread-safe asyncio + warm_up
 │   │   ├── pdf.py                  #   rasterisation PDF → images
 │   │   ├── form_analyzer.py        #   analyse clé/valeur + validation métier
 │   │   ├── char_corrector.py       #   déconfusion OCR + lexes
@@ -231,7 +259,7 @@ scriptvault_ocr/
 │   │   ├── download_paddle_onnx_models.py  #   télécharge les modèles ONNX PP-OCRv5
 │   │   ├── download_trocr_models.py        #   télécharge les modèles ONNX TrOCR
 │   │   └── api/                    #   FastAPI (health/ocr/batches/form/export)
-│   └── tests/                      #   pytest (core, api, form, batches, htr…)
+│   └── tests/                      #   pytest (core, api, form, batches, vlm_reader, htr…)
 ├── web/                            # Interface React + Vite (indépendante)
 │   └── src/
 │       ├── App.jsx                 #   orchestration (files, OCR, lots, export)
@@ -253,6 +281,7 @@ scriptvault_ocr/
 - **Python 3.11+** (3.13 recommandé et testé par CI)
 - **Node 18+** pour le web
 - **Windows 10/11, Ubuntu 20.04+, ou macOS arm64**
+- **(Optionnel) [Ollama](https://ollama.com)** pour la lecture manuscrite VLM
 
 ### 1. Backend (API)
 
@@ -274,7 +303,38 @@ python main.py --lang fr            # http://127.0.0.1:8000  - docs interactives
 Sans les modèles ONNX téléchargés, le moteur bascule automatiquement sur le
 repli PaddlePaddle (plus lent, voir l'étude de performance).
 
-### 2. Lecture par zones (feuilles d'examen)
+### 2. Lecture VLM des bandes manuscrites (optionnel, recommandé)
+
+La lecture manuscrite par grilles utilise un **modèle de vision local** servi
+par [Ollama](https://ollama.com) :
+
+```bash
+# 1. Installer Ollama, puis tirer le modèle (une seule fois) :
+ollama pull qwen2.5vl:7b
+
+# 2. Lancer le serveur Ollama (par défaut http://127.0.0.1:11434) :
+ollama serve
+
+# 3. Activer le VLM dans ScriptVault :
+export SCRIPTVAULT_VLM_ENABLED=true        # Windows : set SCRIPTVAULT_VLM_ENABLED=true
+python main.py --lang fr
+```
+
+Le modèle est **pré-chargé au démarrage** du serveur (`warm_up`). Réglages :
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `SCRIPTVAULT_VLM_ENABLED` | — (désactivé) | Active le lecteur VLM |
+| `SCRIPTVAULT_VLM_URL` | `http://127.0.0.1:11434` | Endpoint Ollama |
+| `SCRIPTVAULT_VLM_MODEL` | `qwen2.5vl:7b` | Modèle vision |
+| `SCRIPTVAULT_VLM_TIMEOUT_S` | `2` | Timeout d'un appel (étendu à froid) |
+| `SCRIPTVAULT_VLM_MAX_TOKENS` | `32` | Bornes de la réponse JSON |
+| `SCRIPTVAULT_VLM_TEMPERATURE` | `0.0` | Déterminisme (0 = froid) |
+
+Sans VLM actif ou si Ollama est injoignable, les champs manuscrits retombent
+sur le chemin HTR TrOCR, puis sur le chemin générique.
+
+### 3. Lecture par zones (feuilles d'examen)
 
 Définissez un profil de champs ; l'OCR transcrit chaque zone en associant
 directement la valeur au champ du gabarit :
@@ -295,9 +355,9 @@ python -m scriptvault.core_ocr scan.tif --roi-json '{"nom": [0.02, 0.09, 0.6, 0.
 Configuration par variables d'environnement `SCRIPTVAULT_*`
 (`SCRIPTVAULT_PORT`, `SCRIPTVAULT_LANG`, `SCRIPTVAULT_MODEL_DIR`,
 `SCRIPTVAULT_MAX_CONCURRENCY` — défaut `1`, `SCRIPTVAULT_ROI`,
-`SCRIPTVAULT_CORS_ORIGINS`, …).
+`SCRIPTVAULT_CORS_ORIGINS`, `SCRIPTVAULT_VLM_*`, …).
 
-### 3. Web (React + Vite)
+### 4. Web (React + Vite)
 
 ```bash
 cd web
@@ -313,7 +373,7 @@ Le serveur Vite proxy `/api` vers `http://127.0.0.1:8000` (backend requis).
 
 | Méthode | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/health` | État du serveur, pool de moteurs, pré-chargement |
+| `GET` | `/api/health` | État du serveur, pool de moteurs, pré-chargement (VLM inclus) |
 | `POST` | `/api/ocr/single` | OCR d'une image **ou PDF** (multipart `file`) — `preview=true` renvoie l'image analysée |
 | `POST` | `/api/ocr/batch` | Lot de fichiers (multipart `files`, concurrence bornée, échecs isolés) |
 | `POST` | `/api/batches` | Créer un lot depuis des fichiers **ou un dossier localStorage** |
@@ -373,9 +433,11 @@ règle métier violée).
 2. **Récolte des champs numériques** — CIN, série, identifiant, nombre de
    cahiers sont recherchés en zones voisines de l'étiquette (lecture grille
    par grille sur composite) ;
-3. **Récolte des champs nominatifs** — si un champ nom/prénom est vide
-   (glyphe parasite), le voisin lexicographique le plus plausible de la page
-   est récupéré par distance au label ;
+3. **Récolte des champs nominatifs** — les bandes manuscrites sont découpées
+   en **grilles numérotées** et transcrites par le VLM local ; chaque rangée
+   incomplète est **relue en cascade** (grille suivante, puis ligne seule
+   agrandie) et toute rangée manquante est récupérée — plus de champ vide
+   « non lus par l'OCR » ; les lignes « libellé seul » sont filtrées ;
 4. **Corrections OCR** — table de confusion, noms de lexiques
    (ex. `Elloom` → `Elloumi`), dates tolérantes
    (`Lundi 03 Juin 2024 à 8 H` → `03/06/2024`) ;
@@ -398,11 +460,11 @@ règle métier violée).
 
 | Capacité | Statut | Détails |
 |---|---|---|
-| **Inférence** | 100% on-premise | ONNX Runtime / PaddlePaddle CPU ; aucune API externe |
+| **Inférence** | 100% on-premise | ONNX Runtime / PaddlePaddle CPU + **VLM local via Ollama** (`127.0.0.1`) ; aucune API externe |
 | **Egress réseau** | Aucun | Pas de télémétrie, pas de crash-report, air-gap compatible |
 | **Données au repos** | Contrôle utilisateur | Documents lus en mémoire ; exports écrits où l'utilisateur choisit |
 | **Bind API** | Loopback par défaut | `127.0.0.1` (exposition réseau explicite via `--host`) |
-| **Téléchargements modèles** | Ponctuel / optionnel | Poids mis en cache dans `models/` (ou fournis hors-ligne) |
+| **Téléchargements modèles** | Ponctuel / optionnel | Poids mis en cache dans `models/` (ou fournis hors-ligne) ; le modèle VLM est géré par Ollama en local |
 | **Zero-Trust readiness** | Compatible | Fonctionne en environnement air-gapped avec modèles embarqués |
 | **GDPR readiness** | Prêt | Aucun traitement tiers, aucun transfert transfrontalier |
 | **Politique de dépendances** | Verrouillée | `requirements.txt` épingle les versions exactes |
@@ -438,11 +500,11 @@ build **Vite** pour chaque push sur `main`.
 
 Distribué sous **Apache License 2.0**. Voir [LICENSE](LICENSE). Ce projet
 dépend de bibliothèques tierces soumises à leurs propres licences
-(PaddlePaddle, PaddleOCR, ONNX Runtime, FastAPI, React, Vite, …).
+(PaddlePaddle, PaddleOCR, ONNX Runtime, Ollama, FastAPI, React, Vite, …).
 
 ---
 
 ## Contact
 
-- **Issues & feature requests:** [GitHub Issues](https://github.com/Omar-khecharem/omar-lab/issues)
+- **Issues & feature requests:** [GitHub Issues](https://github.com/Omar-khecharem/ScriptVaultOcr/issues)
 - **Maintainer:** Omar Khecharem
