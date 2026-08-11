@@ -112,6 +112,14 @@ class Settings:
         default_factory=dict
     )  # zones du formulaire (JSON SCRIPTVAULT_ROI); non vide → OCR par zones
 
+    # --- Lecture manuscrite par VLM local (actif par défaut) ---------------
+    # Route les champs manuscrits (Nom, Prénom, Établissement) et les bandes
+    # du formulaire vers un VLM local (Ollama/llama.cpp) via
+    # scriptvault.vlm_reader : qwen2.5vl:7b lit « comme Gemini » les lignes
+    # du formulaire. Sans serveur VLM démarré, le pipeline retombe
+    # automatiquement sur TrOCR/PP-OCR (aucune rupture de la chaîne).
+    vlm_enabled: bool = True  # SCRIPTVAULT_VLM_ENABLED
+
     # --- Règles métier & stockage -----------------------------------------
     storage_root: str = "STORAGE"  # racine de réorganisation des fichiers
     archive_encrypt: bool = False  # chiffre AES-256-GCM les fichiers archivés
@@ -169,6 +177,7 @@ class Settings:
             barcode_enabled=_env_bool("SCRIPTVAULT_BARCODE", True),
             barcode_budget_ms=max(1, _env_int("SCRIPTVAULT_BARCODE_BUDGET_MS", 15)),
             roi_profile=_env_roi("SCRIPTVAULT_ROI"),
+            vlm_enabled=_env_bool("SCRIPTVAULT_VLM_ENABLED", True),
             storage_root=_env("SCRIPTVAULT_STORAGE_ROOT", "STORAGE"),
             archive_encrypt=_env_bool("SCRIPTVAULT_ARCHIVE_ENCRYPT", False),
             accept_threshold=max(

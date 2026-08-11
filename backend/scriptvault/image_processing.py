@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -51,6 +53,21 @@ logger = logging.getLogger("scriptvault.image_processing")
 
 #: Taille de travail commune aux détecteurs OpenCV (économie CPU).
 _WORK_SIDE = 1400
+
+#: Un reconnaisseur de secours ``(crop) -> (texte, confiance)`` (TrOCR).
+HandwrittenRecognizer = Callable[[np.ndarray], tuple[str, float]]
+
+#: Un lecteur de champ manuscrit **conscient du champ**
+#: ``(crop, field_type) -> (texte, confiance)`` (VLM local).
+HandwrittenReader = Callable[[np.ndarray, str], tuple[str, float]]
+
+#: Un lecteur de grille de bandes ``(grille, première, dernière) -> ...``
+#: (VLM local) : lit toutes les lignes numérotées de la grille en un appel
+#: et retourne ``[(index_absolu, texte, confiance), ...]`` — ``None`` si
+#: l'appel a échoué (le pipeline retombe sur le chemin TrOCR).
+BandGridReader = Callable[
+    [np.ndarray, int, int], Optional[list[tuple[int, str, float]]]
+]
 
 #: Plage de tailles (px, repère page) des cases de chiffres du gabarit.
 _CELL_MIN = 60
@@ -561,7 +578,10 @@ def read_exam_form_zones(
     ] = None,
     digit_classifier: Optional[DigitClassifier] = None,
     max_side: int = _WORK_SIDE,
-    htr_recognize: Optional[Callable[[np.ndarray], tuple[str, float]]] = None,
+    htr_recognize: Optional[HandwrittenRecognizer] = None,
+    handwritten_reader: Optional[HandwrittenReader] = None,
+    handwritten_fields: tuple[str, ...] = ("nom", "prenom"),
+    band_grid_reader: Optional[BandGridReader] = None,
 ) -> list[dict[str, Any]]:
     """Lit une feuille d'examen zone par zone (jamais la page entière).
 
@@ -575,6 +595,21 @@ def read_exam_form_zones(
         htr_recognize: transcrit une zone manuscrite → ``(texte, confiance)``
             (moteur TrOCR). Utilisé pour les champs manuscrits (nom/prénom)
             où PP-OCR est faible.
+        handwritten_reader: lecteur de champ manuscrit **conscient du champ**
+            ``(crop, field_type) -> (texte, confiance)`` (ex. VLM local) —
+            prioritaire sur ``htr_recognize`` : chaque champ reçoit son type
+            (``nom``, ``prenom``, ``etablissement``) pour un prompt
+            contextuel. Son repli interne (TrOCR/PP-OCR) préserve la chaîne.
+        handwritten_fields: champs rédigés à la main relus par le lecteur
+            manuscrit (``nom``/``prenom`` par défaut ; ``etablissement`` en
+            plus quand le lecteur VLM est actif).
+        band_grid_reader: lecteur de grille de bandes
+            ``(grille, première, dernière) -> [(index, texte, confiance)]``
+            (VLM local). Quand il est fourni, les bandes sont lues en un
+            appel VLM (grille numérotée) au lieu de la passe composite OCR —
+            lecture « comme Gemini » : chaque ligne « libellé : valeur » est
+            transcrite correctement même quand TrOCR hallucine. ``None`` en
+            retour = repli sur le chemin composite TrOCR.
 
     Returns:
         Items type ``[{"text", "confidence", "box", "label"}]`` — les clés
@@ -647,7 +682,14 @@ def read_exam_form_zones(
 
     items.extend(
         _transcribe_band_rows(
-            image, crop_pairs, recognize_crop, recognize_crops, htr_recognize
+            image,
+            crop_pairs,
+            recognize_crop,
+            recognize_crops,
+            htr_recognize,
+            handwritten_reader,
+            handwritten_fields,
+            band_grid_reader,
         )
     )
 
@@ -668,7 +710,10 @@ def _transcribe_band_rows(
     recognize_crops: Optional[
         Callable[[list[np.ndarray]], list[list[dict[str, Any]]]]
     ],
-    htr_recognize: Optional[Callable[[np.ndarray], tuple[str, float]]] = None,
+    htr_recognize: Optional[HandwrittenRecognizer] = None,
+    handwritten_reader: Optional[HandwrittenReader] = None,
+    handwritten_fields: tuple[str, ...] = ("nom", "prenom"),
+    band_grid_reader: Optional[BandGridReader] = None,
 ) -> list[dict[str, Any]]:
     """Transcrit les rangées en une seule passe réseau (image composite).
 
@@ -678,11 +723,18 @@ def _transcribe_band_rows(
     et les coordonnées sont remises à l'échelle du repère page.
 
     Les champs manuscrits (Nom/Prénom) sont **retranscrits par le moteur
-    HTR** (TrOCR) si ``htr_recognize`` est fourni : PP-OCR lit mal les
+    HTR** (TrOCR) si ``htr_recognize`` est fourni, ou par le lecteur
+    ``handwritten_reader`` (VLM local, prioritaire) : PP-OCR lit mal les
     lettres manuscrites.
 
     Repli : si la passe composite échoue (ex. modèle HTR saturé), les rangées
     sont transcrites individuellement (comportement historique).
+
+    **Lecture grille VLM** (``band_grid_reader``) : quand le moteur OCR local
+    lit mal les bandes (TrOCR hallucine sur ce scanner), la grille numérotée
+    est lue en un appel VLM (comme le ferait Gemini) : chaque ligne « libellé
+    : valeur » est lue telle quelle. Si le lecteur échoue (``None``), le
+    chemin composite TrOCR historique reprend.
     """
     if not pairs:
         return []
@@ -715,7 +767,6 @@ def _transcribe_band_rows(
         for entry in items:
             box = entry.get("box")
             if box:
-                cx = sum(pt[0] for pt in box) / 4.0
                 cy = sum(pt[1] for pt in box) / 4.0
                 band, top, s, yc0, _ = min(
                     ranges, key=lambda r: abs(cy - (r[3] + r[4]) / 2.0)
@@ -752,14 +803,42 @@ def _transcribe_band_rows(
         return result
 
     try:
+        if band_grid_reader is not None:
+            mapped = _read_bands_via_grid(band_grid_reader, rows, metas, width, height)
+            if mapped is not None:
+                mapped = _assign_labels(mapped)
+                mapped = _re_read_incomplete_bands(
+                    image,
+                    pairs,
+                    rows,
+                    metas,
+                    mapped,
+                    band_grid_reader,
+                    recognize_crops,
+                    recognize_crop,
+                    handwritten_reader,
+                    handwritten_fields,
+                )
+                return mapped
+            logger.warning("Lecture grille VLM indisponible ; repli composite TrOCR.")
         if recognize_crops is not None:
             results = recognize_crops([composite])
             mapped = _map_back(results[0] if results else [])
         else:
             mapped = _map_back(recognize_crop(composite))
         mapped = _assign_labels(mapped)
-        if htr_recognize is not None:
-            mapped = _re_recognize_handwritten(image, pairs, mapped, htr_recognize)
+        if handwritten_reader is not None:
+            mapped = _re_recognize_handwritten(
+                image, pairs, mapped, handwritten_reader, handwritten_fields
+            )
+        elif htr_recognize is not None:
+
+            def reader(crop: np.ndarray, _field: str) -> tuple[str, float]:
+                return htr_recognize(crop)
+
+            mapped = _re_recognize_handwritten(
+                image, pairs, mapped, reader, handwritten_fields
+            )
         return mapped
     except Exception:
         logger.warning("Passe composite échouée ; repli rangée par rangée.", exc_info=True)
@@ -808,29 +887,361 @@ def _stack_composite(rows: list[np.ndarray]) -> np.ndarray:
     return canvas
 
 
+# --------------------------------------------------------------------------- #
+# Grille numérotée pour la lecture VLM des bandes
+# --------------------------------------------------------------------------- #
+#: Hauteur cible (px) d'une rangée dans la grille VLM.
+_GRID_ROW_H = 72
+#: Écart (px) entre deux rangées de la grille VLM.
+_GRID_GAP = 12
+#: Largeur (px) de la marge de gauche accueillant le numéro de rangée.
+_GRID_MARGIN_W = 120
+#: Largeur maximale (px) de la partie « rangée » d'une grille VLM.
+_GRID_MAX_W = 1280
+#: Nombre maximal de rangées par grille (l'image reste lisible pour le VLM).
+_GRID_MAX_ROWS = 16
+#: Couleur des numéros de rangée (gris foncé, lisible mais discret).
+_GRID_NUM_COLOR = (70, 70, 70)
+
+
+def _build_band_grid(
+    rows: list[np.ndarray],
+    row_offset: int,
+    *,
+    max_rows: int = _GRID_MAX_ROWS,
+    row_height: int = _GRID_ROW_H,
+) -> list[tuple[np.ndarray, int, int]]:
+    """Découpe des rangées en grilles numérotées pour la lecture VLM.
+
+    Chaque grille contient au plus ``max_rows`` rangées (hauteur uniforme
+    ``row_height``), numérotées en absolu (``1..N``) dans la marge gauche.
+    Retourne ``[(grille, première, dernière), ...]`` — le lecteur VLM reçoit
+    les bornes absolues et retourne les lignes lues avec leur index.
+
+    ``row_height`` permet une relecture ciblée d'une seule rangée plus
+    grande (image plus nette pour le VLM) que la grille multi-lignes.
+    """
+    grids: list[tuple[np.ndarray, int, int]] = []
+    for start in range(0, len(rows), max_rows):
+        chunk = rows[start : start + max_rows]
+        resized: list[np.ndarray] = []
+        max_w = _GRID_MAX_W - _GRID_MARGIN_W
+        for row in chunk:
+            scale = row_height / max(1, row.shape[0])
+            width = max(1, int(round(row.shape[1] * scale)))
+            if width > max_w:
+                width = max_w
+                scale = width / max(1, row.shape[1])
+            height = max(1, int(round(row.shape[0] * scale)))
+            resized.append(cv2.resize(row, (width, height), interpolation=cv2.INTER_AREA))
+        grid_w = _GRID_MARGIN_W + max(r.shape[1] for r in resized)
+        grid_h = sum(r.shape[0] for r in resized) + _GRID_GAP * (len(resized) - 1)
+        grid = np.full((grid_h, grid_w, 3), 255, dtype=np.uint8)
+        y = 0
+        for idx, item in enumerate(resized):
+            number = start + idx + 1
+            cv2.putText(
+                grid,
+                str(number),
+                (10, y + item.shape[0] // 2 + 14),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                _GRID_NUM_COLOR,
+                2,
+            )
+            grid[
+                y : y + item.shape[0], _GRID_MARGIN_W : _GRID_MARGIN_W + item.shape[1]
+            ] = item
+            y += item.shape[0] + _GRID_GAP
+        grids.append((grid, start + 1, start + len(resized)))
+    return grids
+
+
+def _read_bands_via_grid(
+    band_grid_reader: BandGridReader,
+    rows: list[np.ndarray],
+    metas: list[tuple[FieldBand, int, float]],
+    width: int,
+    height: int,
+) -> Optional[list[dict[str, Any]]]:
+    """Lit toutes les bandes via le lecteur de grille VLM (ou ``None``).
+
+    Retourne un item par bande lue : ``text`` = « libellé : valeur » tel que
+    le VLM l'a lu (l'étiquetage et le nettoyage de la valeur interviennent en
+    aval, dans ``form_analyzer``), ``box`` = rangée entière dans le repère
+    page, ``confidence`` du VLM. ``None`` si le lecteur a échoué — le pipeline
+    retombe alors sur la passe composite TrOCR historique.
+    """
+    grids = _build_band_grid(rows, 0)
+    found: list[tuple[int, str, float]] = []
+    for grid, first, last in grids:
+        result = band_grid_reader(grid, first, last)
+        if result is None:
+            return None
+        found.extend(result)
+    by_index = {index: (text, conf) for index, text, conf in found}
+    items: list[dict[str, Any]] = []
+    for i, (band, top, scale) in enumerate(metas):
+        text, conf = by_index.get(i + 1, ("", 0.0))
+        text = str(text or "").strip()
+        if not text:
+            continue
+        bottom = top + int(round(rows[i].shape[0] / max(1e-6, scale)))
+        items.append(
+            {
+                "text": text,
+                "confidence": conf,
+                "box": [[0, top], [width, top], [width, bottom], [0, bottom]],
+            }
+        )
+    return items
+
+
+#: Rangées dont la valeur ne vient PAS de la lecture VLM de la rangée :
+#: la valeur est portée par une grille de cases (chiffres) ou absente par
+#: conception (zones de signature / anonymat). Pas de relecture inutile.
+_NO_REREAD_KEYS: frozenset[str] = frozenset(
+    {"cin", "serie", "identifiant", "zone_signature", "anonyme"}
+)
+
 #: Champs rédigés à la main (l'OCR PP-OCR y est faible → HTR TrOCR).
-_HTR_FIELDS = ("nom", "prenom")
+#: ``etablissement`` s'y ajoute quand le lecteur VLM est actif (le sigle
+#: manuscrit exige le prompt contextuel des acronymes).
+_HTR_FIELDS: tuple[str, ...] = ("nom", "prenom")
 
 
+def _row_text_complete(text: str) -> bool:
+    """Vrai si la rangée a une valeur exploitable (« libellé : valeur »).
+
+    Un texte sans valeur (chaîne vide, « libellé : » seul) est considéré
+    incomplet : la relecture ciblée tentera de le récupérer.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return False
+    if ":" not in text and "：" not in text:
+        return True
+    tail = re.split(r"[:：]", text)[-1].strip()
+    return any(ch.isalnum() for ch in tail)
+
+
+#: Budget maximal (s) d'une relecture VLM mono-ligne : quand le modèle est
+#: en rechargement à froid, un appel peut durer ~3 min (timeout de grille) ;
+#: la relecture abandonne au budget et laisse le repli TrOCR prendre le relais.
+_REREAD_BUDGET_S = 30.0
+
+
+def _read_single_row(
+    band_grid_reader: BandGridReader,
+    row: np.ndarray,
+    budget_s: float = _REREAD_BUDGET_S,
+) -> Optional[tuple[str, float]]:
+    """Relit une rangée en grille VLM mono-ligne, bornée par ``budget_s``."""
+    result: dict[str, object] = {}
+
+    def _run() -> None:
+        try:
+            grids = _build_band_grid([row], 0, row_height=_GRID_ROW_H * 2)
+            single = band_grid_reader(grids[0][0], 1, 1) if grids else None
+            if single:
+                result["out"] = (
+                    str(single[0][1] or "").strip(),
+                    float(single[0][2] or 0.0),
+                )
+        except Exception as exc:  # pragma: no cover - défensif
+            result["err"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout=budget_s)
+    out = result.get("out")
+    if isinstance(out, tuple):
+        return out
+    return None
+
+
+def _row_has_value(text: str) -> bool:
+    """Vrai si le texte porte une valeur après le séparateur (« libellé : valeur »).
+
+    Plus strict que :func:`_row_text_complete` : un texte sans séparateur
+    (ex. une relecture qui n'a capté que le libellé imprimé) n'est pas une
+    valeur exploitable.
+    """
+    text = str(text or "").strip()
+    if ":" not in text and "：" not in text:
+        return False
+    tail = re.split(r"[:：]", text)[-1].strip()
+    return any(ch.isalnum() for ch in tail)
+
+
+def _re_read_incomplete_bands(
+    image: np.ndarray,
+    pairs: list[tuple[FieldBand, np.ndarray]],
+    rows: list[np.ndarray],
+    metas: list[tuple[FieldBand, int, float]],
+    items: list[dict[str, Any]],
+    band_grid_reader: BandGridReader,
+    recognize_crops: Optional[
+        Callable[[list[np.ndarray]], list[list[dict[str, Any]]]]
+    ],
+    recognize_crop: Callable[[np.ndarray], list[dict[str, Any]]],
+    handwritten_reader: Optional[HandwrittenReader] = None,
+    handwritten_fields: tuple[str, ...] = _HTR_FIELDS,
+) -> list[dict[str, Any]]:
+    """Relecture ciblée des rangées que la grille VLM a manquées ou rendues vides.
+
+    Le VLM peut sauter une ligne (ou renvoyer « libellé : » sans valeur),
+    ce qui laissait un champ « non lu » en aval. Chaque rangée incomplète
+    est relue en cascade, du plus fiable au plus économique :
+
+    1. **Grille VLM mono-ligne** : une seule rangée agrandie (image plus
+       nette) relue par le VLM ;
+    2. **Passe réseau locale** : PP-OCR sur la rangée (excellent sur
+       l'imprimé, lit au moins le libellé) ;
+    3. **Lecteur manuscrit dédié** : pour les champs ``nom``/``prenom``/
+       ``etablissement``, la zone de valeur est relue avec le prompt
+       contextuel du champ (VLM local, repli TrOCR).
+
+    Les rangées sans valeur par conception (``_NO_REREAD_KEYS``) et celles
+    déjà complètes ne coûtent aucun appel supplémentaire.
+    """
+    height, width = image.shape[:2]
+    by_index: dict[int, dict[str, Any]] = {}
+    for entry in items:
+        box = entry.get("box")
+        if not box:
+            continue
+        top = box[0][1]
+        for idx, (_band, meta_top, _scale) in enumerate(metas):
+            if abs(top - meta_top) < 8:
+                by_index[idx] = entry
+                break
+
+    def _row_box(idx: int) -> list[list[int]]:
+        _band, top, scale = metas[idx]
+        bottom = top + int(round(rows[idx].shape[0] / max(1e-6, scale)))
+        return [[0, top], [width, top], [width, bottom], [0, bottom]]
+
+    repaired: list[dict[str, Any]] = []
+    for idx, (band, _crop) in enumerate(pairs):
+        item = by_index.get(idx)
+        text = str(item.get("text", "") if item else "").strip()
+        if _row_text_complete(text):
+            if item is not None:
+                repaired.append(item)
+            continue
+        key = item.get("label") if item else None
+        if key is None and text:
+            key = match_field_label(text)
+        if key in _NO_REREAD_KEYS:
+            continue
+        conf = float(item.get("confidence", 0.0)) if item else 0.0
+        label = key
+        new_text = ""
+        handwritten_ok = False
+
+        # 1 — Relecture VLM mono-ligne (rangée agrandie, budget borné).
+        single = _read_single_row(band_grid_reader, rows[idx])
+        if single:
+            new_text, re_conf = single
+            conf = re_conf
+            label = label or match_field_label(new_text)
+
+        # 2 — Passe réseau locale sur la rangée (libellé imprimé).
+        if not _row_has_value(new_text):
+            try:
+                local: list[list[dict[str, Any]]] = (
+                    recognize_crops([rows[idx]]) if recognize_crops is not None else []
+                )
+                if not local:
+                    local = [recognize_crop(rows[idx]) or []]
+                parts = [
+                    str(entry.get("text", "")).strip()
+                    for entry in local[0]
+                    if str(entry.get("text", "")).strip()
+                ]
+                if parts:
+                    new_text = " ".join(parts)
+                    label = label or match_field_label(new_text)
+                    conf = max(
+                        (float(entry.get("confidence", 0.0)) or 0.0) for entry in local[0]
+                    )
+            except Exception:
+                logger.warning(
+                    "Relecture locale bande %d échouée.", idx, exc_info=True
+                )
+
+        # 3 — Lecteur manuscrit dédié sur la zone de valeur.
+        if (
+            not _row_has_value(new_text)
+            and handwritten_reader is not None
+            and label in handwritten_fields
+        ):
+            try:
+                value_crop = crop_field_value(image, band)
+                if value_crop.size > 0:
+                    htr_text, htr_conf = handwritten_reader(value_crop, label)
+                    htr_text = str(htr_text or "").strip()
+                    if len(htr_text) >= 2:
+                        new_text = htr_text
+                        conf = float(htr_conf or 0.0)
+                        handwritten_ok = True
+            except Exception:
+                logger.warning(
+                    "Relecture manuscrite bande %d échouée.", idx, exc_info=True
+                )
+
+        # Ne garde que les relectures portant une vraie valeur : un « libellé
+        # seul » (ex. zone de signature, bande CIN sans valeur) n'apporte que
+        # du bruit au formulaire.
+        if not new_text:
+            continue
+        if not (_row_has_value(new_text) or handwritten_ok):
+            continue
+        if item is not None:
+            item["text"] = new_text
+            item["confidence"] = round(conf, 4)
+            if label:
+                item["label"] = label
+            repaired.append(item)
+        else:
+            repaired.append(
+                {
+                    "text": new_text,
+                    "confidence": round(conf, 4),
+                    "box": _row_box(idx),
+                    **({"label": label} if label else {}),
+                }
+            )
+    return repaired
+
+
+#: Champs rédigés à la main (l'OCR PP-OCR y est faible → HTR TrOCR).
+#: ``etablissement`` s'y ajoute quand le lecteur VLM est actif (le sigle
+#: manuscrit exige le prompt contextuel des acronymes).
 def _re_recognize_handwritten(
     image: np.ndarray,
     pairs: list[tuple[FieldBand, np.ndarray]],
     items: list[dict[str, Any]],
-    htr_recognize: Callable[[np.ndarray], tuple[str, float]],
+    handwritten_reader: HandwrittenReader,
+    handwritten_fields: tuple[str, ...] = _HTR_FIELDS,
 ) -> list[dict[str, Any]]:
-    """Retranscrit les champs manuscrits (Nom/Prénom) avec le moteur HTR.
+    """Retranscrit les champs manuscrits avec le lecteur ``handwritten_reader``.
 
     Le réseau PP-OCR est excellent sur l'imprimé mais faible sur les lettres
     manuscrites (ex. ``Nom : ... Ellmi`` → ``"Nom:.D"``). Pour chaque rangée
-    étiquetée ``nom``/``prenom``, la zone de valeur (à droite de la ligne
-    pointillée) est découpée puis transcrite par TrOCR. Si la lecture HTR est
-    fiable (≥ 2 lettres, confiance ≥ 0.5), elle remplace la lecture composite.
+    étiquetée dans ``handwritten_fields`` (``nom``, ``prenom``,
+    ``etablissement``), la zone de valeur (à droite de la ligne pointillée)
+    est découpée puis transcrite par le lecteur — qui reçoit **le type du
+    champ** (``field_type``) pour son prompt contextuel (VLM local) et bascule
+    sur son repli (TrOCR/PP-OCR) en cas d'échec. Si la lecture est fiable
+    (≥ 2 lettres, confiance ≥ 0.5), elle remplace la lecture composite.
     """
     if not items or not pairs:
         return items
     by_key = {entry.get("label"): entry for entry in items}
     changed: dict[str, tuple[str, float]] = {}
-    for label in _HTR_FIELDS:
+    for label in handwritten_fields:
         entry = by_key.get(label)
         if entry is None:
             continue
@@ -844,9 +1255,9 @@ def _re_recognize_handwritten(
         if crop.size == 0:
             continue
         try:
-            text, conf = htr_recognize(crop)
+            text, conf = handwritten_reader(crop, label)
         except Exception:
-            logger.warning("Relecture HTR %s échouée.", label, exc_info=True)
+            logger.warning("Relecture manuscrite %s échouée.", label, exc_info=True)
             continue
         text = str(text or "").strip()
         letters = sum(1 for ch in text if ch.isalpha())

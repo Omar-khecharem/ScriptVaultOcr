@@ -106,18 +106,21 @@ async def _predict_page(
 ) -> OCRPage:
     """Prétraite, infère et normalise une page (image ou page de PDF).
 
-    Le prétraitement est appliqué ici (et non dans le moteur) afin de pouvoir
-    renvoyer l'image exactement analysée : les boîtes OCR sont ainsi toujours
-    alignées avec la prévisualisation.
+    L'image analysée par le moteur est la page **brute** (le prétraitement
+    OpenCV dégrade le manuscrit pour le VLM : la grille de bandes y devient
+    illisible) ; l'image ``processed`` n'est produite que pour la
+    prévisualisation. Les boîtes sont donc exprimées dans le repère de la
+    page brute, comme dans le flux /api/batches.
     """
-    if use_preprocess:
-        processed = await asyncio.to_thread(
-            preprocessor.preprocess, image, binarize=True
-        )
-    else:
-        processed = image
-    items = await engines.predict_array(processed, lang=lang, preprocess=False)
-    height, width = processed.shape[:2]
+    processed = (
+        await asyncio.to_thread(preprocessor.preprocess, image, binarize=True)
+        if use_preprocess
+        else image
+    )
+    items = await engines.predict_array(
+        image, lang=lang, preprocess=use_preprocess
+    )
+    height, width = image.shape[:2]
     return OCRPage(
         page=page_number,
         width=int(width),
@@ -130,6 +133,7 @@ async def _predict_page(
                 text=str(item.get("text", "")),
                 confidence=float(item.get("confidence", 0.0)),
                 box=item.get("box") or [],
+                label=str(item.get("label") or "") or None,
             )
             for item in items
         ],

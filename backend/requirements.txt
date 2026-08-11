@@ -13,6 +13,9 @@ onnxruntime>=1.20,<1.28      # ORT CPU — greedy decoding TrOCR (thread-safe)
 opencv-contrib-python==4.10.0.84      # cv2.barcode + pipeline (>= 4.8 requis)
 numpy==2.3.5                          # Arrays — compatible OpenCV 4.x
 
+# --- Lecture VLM local (Ollama/llama.cpp) : champs manuscrits ---------------
+httpx>=0.27,<1                 # client HTTP asynchrone (reader VLM local)
+
 # --- API serveur ------------------------------------------------------------
 fastapi>=0.115,<1                     # Framework REST asynchrone
 uvicorn[standard]>=0.30,<1            # Serveur ASGI

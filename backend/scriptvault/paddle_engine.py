@@ -155,6 +155,7 @@ class PaddleOCREngine:
         barcode_max_preview_side: int = 1000,
         det_model_name: str = _DEFAULT_DET_MODEL,
         rec_model_name: str = _DEFAULT_REC_MODEL,
+        vlm_reader: Optional[Any] = None,
     ) -> None:
         self.logger = logger or logging.getLogger("scriptvault.paddle_engine.engine")
         self.lang = lang
@@ -182,6 +183,24 @@ class PaddleOCREngine:
         self.cpu_threads = cpu_threads if cpu_threads > 0 else (os.cpu_count() or 4)
         self._htr: Any = None
         self._htr_lock = threading.Lock()
+
+        # --- Champs manuscrits : VLM local (direct) sinon TrOCR (repli) --- #
+        self._vlm_reader: Optional[Any] = vlm_reader
+        self._handwritten_fields: tuple[str, ...] = ("nom", "prenom")
+        self._handwritten_reader: Any = None
+        self._band_grid_reader: Any = None
+        if vlm_reader is not None:
+            if getattr(vlm_reader, "fallback", None) is None:
+                vlm_reader.fallback = self._htr_recognize
+            self._handwritten_reader = self._vlm_handwritten_read
+            self._handwritten_fields = ("nom", "prenom", "etablissement")
+            # Lecture grille : toutes les bandes sont lues par le VLM (comme
+            # Gemini) quand l'OCR local lit mal les bandes ; repli TrOCR sinon.
+            self._band_grid_reader = self._vlm_band_grid_read
+            self.logger.info(
+                "Lecture manuscrite routée vers le VLM local (%s).",
+                getattr(getattr(vlm_reader, "config", None), "model", "?"),
+            )
         self.warm_up()
 
     # ------------------------------------------------------------------ #
@@ -202,8 +221,7 @@ class PaddleOCREngine:
         if self._ocr is not None:
             return self._ocr
         try:
-            from .onnx_ocr import _default_model_dir
-            from .onnx_ocr import OnnxPaddleOCR
+            from .onnx_ocr import OnnxPaddleOCR, _default_model_dir
 
             if os.path.exists(os.path.join(_default_model_dir(), "PP-OCRv5_mobile_det.onnx")):
                 self._ocr = OnnxPaddleOCR(
@@ -269,6 +287,13 @@ class PaddleOCREngine:
         except Exception as exc:  # pragma: no cover - défensif
             self.logger.warning("Fermeture PaddleOCR échouée: %s", exc)
         self._ocr = None
+        vlm = self._vlm_reader
+        if vlm is not None:
+            try:
+                vlm.close()
+            except Exception as exc:  # pragma: no cover - défensif
+                self.logger.warning("Fermeture du lecteur VLM échouée: %s", exc)
+            self._vlm_reader = None
         self._ready = False
 
     def __enter__(self) -> "PaddleOCREngine":
@@ -340,6 +365,51 @@ class PaddleOCREngine:
         except Exception as exc:
             self.logger.warning("Relecture HTR échouée: %s", exc)
             return "", 0.0
+
+    def _vlm_handwritten_read(self, crop: np.ndarray, field_type: str) -> tuple[str, float]:
+        """Routage VLM : lecture directe du crop manuscrit, repli TrOCR.
+
+        Le VLM local reçoit la zone découpée + le type de champ (prompt
+        contextuel : acronymes d'établissements, lexique de noms tunisiens).
+        En cas d'échec ou de timeout interne, le lecteur bascule sur
+        ``_htr_recognize`` (TrOCR) — la lecture PP-OCR composite est
+        préservée si TrOCR est lui-même indisponible.
+        """
+        reader = self._vlm_reader
+        if reader is None or not getattr(reader, "is_enabled", False):
+            return self._htr_recognize(crop)
+        try:
+            result = reader.sync_read_handwritten_crop(crop, field_type)
+        except Exception as exc:
+            self.logger.warning("Lecture VLM en échec (%s) ; repli HTR.", exc)
+            return self._htr_recognize(crop)
+        text = str(result.get("text", "")).strip()
+        if not text:
+            return "", 0.0
+        return text, max(0.0, min(1.0, float(result.get("confidence", 0.0))))
+
+    def _vlm_band_grid_read(
+        self,
+        grid: np.ndarray,
+        first_row: int,
+        last_row: int,
+    ) -> Optional[list[tuple[int, str, float]]]:
+        """Routage VLM : lecture de la grille des bandes (repli TrOCR sinon).
+
+        Retourne ``None`` si le lecteur VLM n'est pas disponible ou échoue —
+        ``_transcribe_band_rows`` reprend alors la passe composite PP-OCR.
+        """
+        reader = self._vlm_reader
+        if reader is None or not getattr(reader, "is_enabled", False):
+            return None
+        sync = getattr(reader, "sync_read_form_band_grid", None)
+        if not callable(sync):
+            return None
+        try:
+            return sync(grid, first_row, last_row)
+        except Exception as exc:
+            self.logger.warning("Grille VLM en échec (%s) ; repli PP-OCR.", exc)
+            return None
 
     @_as_ocr_error
     def _recognize_crops(
@@ -423,11 +493,19 @@ class PaddleOCREngine:
                 "items"
             ]
         if zones is not False and has_form_structure(image):
+            kwargs: dict[str, Any] = {}
+            if self._handwritten_reader is not None:
+                kwargs["handwritten_reader"] = self._handwritten_reader
+                kwargs["handwritten_fields"] = self._handwritten_fields
+                if self._band_grid_reader is not None:
+                    kwargs["band_grid_reader"] = self._band_grid_reader
+            else:
+                kwargs["htr_recognize"] = self._htr_recognize
             return read_exam_form_zones(
                 image,
                 self._recognize_crop,
                 recognize_crops=self._recognize_crops,
-                htr_recognize=self._htr_recognize,
+                **kwargs,
             )
         if preprocess:
             image, _ = self._preprocessor.resize_for_ocr(
@@ -529,11 +607,19 @@ class PaddleOCREngine:
                         entry["label"] = label
                         items.append(entry)
         elif zones is not False and has_form_structure(page):
+            kwargs: dict[str, Any] = {}
+            if self._handwritten_reader is not None:
+                kwargs["handwritten_reader"] = self._handwritten_reader
+                kwargs["handwritten_fields"] = self._handwritten_fields
+                if self._band_grid_reader is not None:
+                    kwargs["band_grid_reader"] = self._band_grid_reader
+            else:
+                kwargs["htr_recognize"] = self._htr_recognize
             items = read_exam_form_zones(
                 page,
                 self._recognize_crop,
                 recognize_crops=self._recognize_crops,
-                htr_recognize=self._htr_recognize,
+                **kwargs,
             )
             image = page
         else:

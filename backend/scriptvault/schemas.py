@@ -14,6 +14,13 @@ class OCRItem(BaseModel):
     text: str
     confidence: float = Field(ge=0.0, le=1.0)
     box: list[list[int]] = Field(default_factory=list)
+    label: Optional[str] = Field(
+        default=None,
+        description=(
+            "Clé du champ du formulaire quand l'item provient de la lecture "
+            "par zones (ex. ``nom``, ``cin``) — sinon ``None``."
+        ),
+    )
 
 
 class OCRPage(BaseModel):

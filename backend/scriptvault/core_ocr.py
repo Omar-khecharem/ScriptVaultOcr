@@ -82,6 +82,11 @@ OCRResultItem = dict[str, Any]
 ROIFraction = tuple[float, float, float, float]
 ROIProfile = dict[str, ROIFraction]
 
+#: Lecteur de champ manuscrit conscient du champ : ``(crop, field_type)`` →
+#: ``(texte, confiance)``. Le type du champ (``nom``/``prenom``/
+#: ``etablissement``) alimente le prompt contextuel du VLM local.
+HandwrittenReader = Callable[[np.ndarray, str], tuple[str, float]]
+
 F = TypeVar("F", bound=Callable[..., Any])
 
 logger: logging.Logger
@@ -235,6 +240,23 @@ def _mean_confidence(items: list[OCRResultItem]) -> float:
         return 0.0
     scores = [float(item.get("confidence", 0.0)) for item in items]
     return round(sum(scores) / len(scores), 4)
+
+
+def _make_htr_fallback(
+    engine: "LocalOCREngine",
+) -> Callable[[np.ndarray], tuple[str, float]]:
+    """Repli TrOCR du moteur, exposé au lecteur VLM (nommé ``"htr"``).
+
+    Si la lecture VLM directe échoue ou dépasse son délai, le lecteur bascule
+    automatiquement sur ce reconnaisseur de secours — la chaîne OCR conserve
+    sa lecture TrOCR historique, jamais une case vide.
+    """
+
+    def _fallback(crop: np.ndarray) -> tuple[str, float]:
+        return engine._transcribe(crop)
+
+    _fallback.name = "htr"  # type: ignore[attr-defined]
+    return _fallback
 
 
 def make_page_result(
@@ -1029,6 +1051,7 @@ class LocalOCREngine:
         barcode_budget_ms: float = _DEFAULT_BARCODE_BUDGET_MS,
         barcode_max_preview_side: int = _BARCODE_PREVIEW_SIDE,
         min_ink_ratio: float = 0.0015,
+        vlm_reader: Optional[Any] = None,
     ) -> None:
         """Initialise le moteur HTR.
 
@@ -1048,6 +1071,11 @@ class LocalOCREngine:
             min_ink_ratio: Ratio minimal d'encre (dans [0,1]) sous lequel une
                 zone est considérée vide — évite les inférences inutiles et le
                 bruit (règles imprimées, ombres).
+            vlm_reader: Lecteur VLM local (:class:`~scriptvault.vlm_reader
+                .LocalVLMReader`) optionnel. S'il est fourni, les champs
+                manuscrits du formulaire (Nom, Prénom, **et** Établissement)
+                sont lus par le VLM (lecture directe, prompt contextuel), avec
+                repli automatique sur TrOCR en cas d'échec ou de timeout.
 
         Raises:
             OCRInitError: modèles TrOCR ONNX absents (voir
@@ -1064,6 +1092,32 @@ class LocalOCREngine:
         )
         self._min_ink_ratio = max(0.0, float(min_ink_ratio))
         self._ready = False
+
+        # --- Lecture manuscrite : VLM local (direct) sinon TrOCR (repli) --- #
+        self._vlm_reader: Optional[Any] = vlm_reader
+        if vlm_reader is not None:
+            if getattr(vlm_reader, "fallback", None) is None:
+                vlm_reader.fallback = _make_htr_fallback(self)
+            self._handwritten_reader: HandwrittenReader = self._vlm_handwritten_read
+            # L'acronyme d'établissement est aussi manuscrit : le VLM le lit
+            # avec le prompt des acronymes tunisiens (TrOCR seul y est faible).
+            self._handwritten_fields: tuple[str, ...] = (
+                "nom",
+                "prenom",
+                "etablissement",
+            )
+            self.logger.info(
+                "Lecture manuscrite routée vers le VLM local (%s).",
+                getattr(getattr(vlm_reader, "config", None), "model", "?"),
+            )
+            # Lecture grille : TOUTES les bandes sont lues par le VLM (comme
+            # Gemini) — TrOCR hallucine sur certains scanners (passe composite
+            # vide ou charabia). Repli automatique sur TrOCR si le VLM échoue.
+            self._band_grid_reader: Optional[Any] = self._vlm_band_grid_read
+        else:
+            self._handwritten_reader = self._htr_handwritten_read
+            self._handwritten_fields = ("nom", "prenom")
+            self._band_grid_reader = None
 
         self._scan_barcode = bool(barcode)
         self._barcode_scanner = (
@@ -1336,7 +1390,13 @@ class LocalOCREngine:
                 from .image_processing import has_form_structure, read_exam_form_zones
 
                 if has_form_structure(page):
-                    items = read_exam_form_zones(page, self._recognize_crop)
+                    items = read_exam_form_zones(
+                        page,
+                        self._recognize_crop,
+                        handwritten_reader=self._handwritten_reader,
+                        handwritten_fields=self._handwritten_fields,
+                        band_grid_reader=self._band_grid_reader,
+                    )
                     processed = page
                     height, width = page.shape[:2]
                 else:
@@ -1395,6 +1455,58 @@ class LocalOCREngine:
         return text.strip(), confidence
 
     # ------------------------------------------------------------------ #
+    # Champs manuscrits : routage VLM direct (repli TrOCR automatique)
+    # ------------------------------------------------------------------ #
+    def _htr_handwritten_read(self, crop: np.ndarray, field_type: str) -> tuple[str, float]:
+        """Transcrit un champ manuscrit avec TrOCR (comportement historique)."""
+        return self._transcribe(crop)
+
+    def _vlm_handwritten_read(self, crop: np.ndarray, field_type: str) -> tuple[str, float]:
+        """Routage VLM : lecture directe du crop, repli TrOCR automatique.
+
+        La zone sans encre est ignorée (aucun appel VLM inutile). En cas
+        d'échec ou de timeout interne, le lecteur VLM bascule sur le repli
+        TrOCR et le pipeline conserve sa lecture historique.
+        """
+        if crop.size == 0 or _dark_ratio(crop) < self._min_ink_ratio:
+            return "", 0.0
+        reader = self._vlm_reader
+        if reader is None or not getattr(reader, "is_enabled", False):
+            return self._transcribe(crop)
+        try:
+            result = reader.sync_read_handwritten_crop(crop, field_type)
+        except Exception as exc:
+            self.logger.warning("Lecture VLM en échec (%s) ; repli TrOCR.", exc)
+            return self._transcribe(crop)
+        text = str(result.get("text", "")).strip()
+        if not text:
+            return "", 0.0
+        return text, max(0.0, min(1.0, float(result.get("confidence", 0.0))))
+
+    def _vlm_band_grid_read(
+        self,
+        grid: np.ndarray,
+        first_row: int,
+        last_row: int,
+    ) -> Optional[list[tuple[int, str, float]]]:
+        """Routage VLM : lecture de la grille des bandes (repli TrOCR sinon).
+
+        Retourne ``None`` si le lecteur VLM n'est pas disponible ou échoue —
+        ``_transcribe_band_rows`` reprend alors la passe composite TrOCR.
+        """
+        reader = self._vlm_reader
+        if reader is None or not getattr(reader, "is_enabled", False):
+            return None
+        sync = getattr(reader, "sync_read_form_band_grid", None)
+        if not callable(sync):
+            return None
+        try:
+            return sync(grid, first_row, last_row)
+        except Exception as exc:
+            self.logger.warning("Grille VLM en échec (%s) ; repli TrOCR.", exc)
+            return None
+
+    # ------------------------------------------------------------------ #
     # Cycle de vie
     # ------------------------------------------------------------------ #
     def close(self) -> None:
@@ -1406,6 +1518,13 @@ class LocalOCREngine:
             except Exception as exc:  # pragma: no cover - défensif
                 self.logger.warning("Fermeture du backend HTR échouée: %s", exc)
             self._htr = None
+        vlm = self._vlm_reader
+        if vlm is not None:
+            try:
+                vlm.close()
+            except Exception as exc:  # pragma: no cover - défensif
+                self.logger.warning("Fermeture du lecteur VLM échouée: %s", exc)
+            self._vlm_reader = None
         self._ready = False
 
     def __enter__(self) -> "LocalOCREngine":

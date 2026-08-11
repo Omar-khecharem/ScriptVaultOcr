@@ -113,8 +113,44 @@ def _default_engine_factory(settings: Settings) -> Any:
     * ``"paddle"`` — PaddleOCR PP-OCRv5 (qualité imprimé/français) ;
     * ``"htr"`` — TrOCR ONNX (repli sans Paddle) ;
     * ``"auto"`` (défaut) — Paddle si ``paddleocr`` est installé, sinon HTR.
+
+    Si ``settings.vlm_enabled``, un :class:`~scriptvault.vlm_reader
+    .LocalVLMReader` est attaché au moteur : les champs manuscrits du
+    formulaire (Nom, Prénom, Établissement) sont lus en direct par le VLM
+    local (Ollama/llama.cpp) avec repli TrOCR/PP-OCR automatique ; la
+    détection globale et les champs imprimés/chiffres (CIN, Identifiant)
+    restent sur PP-OCRv5/OpenCV.
     """
     backend = (settings.ocr_backend or "auto").lower()
+
+    def _vlm_reader() -> Any:
+        """Construit le lecteur VLM local si activé (``None`` sinon).
+
+        Le modèle est pré-chargé dans Ollama en arrière-plan (``warm_up``) :
+        sans cela, le premier formulaire d'un lot subit le chargement à froid
+        (2-3 min) et peut dépasser le timeout de grille.
+        """
+        if not settings.vlm_enabled:
+            return None
+        try:
+            from .vlm_reader import LocalVLMReader
+
+            reader = LocalVLMReader()
+            try:
+                threading.Thread(
+                    target=reader.warm_up,
+                    name="scriptvault-vlm-warmup",
+                    daemon=True,
+                ).start()
+            except Exception:  # pragma: no cover - défensif
+                logger.debug("Pré-chauffage VLM non lancé.", exc_info=True)
+            return reader
+        except Exception as exc:
+            logger.warning(
+                "VLM local indisponible (%s) ; lecture manuscrite classique.", exc
+            )
+            return None
+
     if backend in ("paddle", "auto"):
         try:
             from .paddle_engine import PaddleOCREngine
@@ -125,6 +161,7 @@ def _default_engine_factory(settings: Settings) -> Any:
                 max_side_len=settings.max_side_len or None,
                 barcode=settings.barcode_enabled,
                 barcode_budget_ms=float(settings.barcode_budget_ms),
+                vlm_reader=_vlm_reader(),
             )
             if not getattr(engine, "is_ready", False):
                 raise OCRInitError("PaddleOCR n'a pas pu initialiser ses modèles.")
@@ -141,6 +178,7 @@ def _default_engine_factory(settings: Settings) -> Any:
         max_side_len=settings.max_side_len or None,
         barcode=settings.barcode_enabled,
         barcode_budget_ms=float(settings.barcode_budget_ms),
+        vlm_reader=_vlm_reader(),
     )
 
 
